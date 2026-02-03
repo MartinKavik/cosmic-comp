@@ -43,9 +43,9 @@ use smithay::{
     desktop::{WindowSurfaceType, layer_map_for_output, space::SpaceElement},
     input::Seat,
     output::Output,
-    reexports::wayland_server::Client,
+    reexports::wayland_server::{Client, protocol::wl_surface::WlSurface},
     utils::{Buffer as BufferCoords, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size},
-    wayland::xdg_activation::XdgActivationState,
+    wayland::{seat::WaylandFocus, xdg_activation::XdgActivationState},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -501,6 +501,19 @@ impl Workspace {
                 FocusTarget::Window(w) => mapped().any(|m| w == m),
             });
         }
+    }
+
+    pub(crate) fn debug_focus_stack_refs_for_surface(&self, surface: &WlSurface) -> usize {
+        self.focus_stack
+            .0
+            .values()
+            .map(|stack| {
+                stack
+                    .iter()
+                    .filter(|target| focus_target_contains_surface(target, surface))
+                    .count()
+            })
+            .sum()
     }
 
     pub fn animations_going(&self) -> bool {
@@ -1833,6 +1846,15 @@ impl Workspace {
         }
 
         Ok(elements)
+    }
+}
+
+fn focus_target_contains_surface(target: &FocusTarget, surface: &WlSurface) -> bool {
+    match target {
+        FocusTarget::Fullscreen(s) => s.wl_surface().as_deref() == Some(surface),
+        FocusTarget::Window(mapped) => mapped
+            .windows()
+            .any(|(window, _)| window.wl_surface().as_deref() == Some(surface)),
     }
 }
 

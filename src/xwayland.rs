@@ -9,7 +9,8 @@ use std::{
 use crate::{
     backend::render::cursor::{Cursor, load_cursor_env, load_cursor_theme},
     shell::{
-        CosmicSurface, PendingWindow, Shell, focus::target::KeyboardFocusTarget, grabs::ReleaseMode,
+        ActivationKey, CosmicSurface, PendingWindow, Shell, focus::target::KeyboardFocusTarget,
+        grabs::ReleaseMode,
     },
     state::State,
     utils::prelude::*,
@@ -56,7 +57,7 @@ use smithay::{
         xwm::{Reorder, XwmId},
     },
 };
-use tracing::{error, trace, warn};
+use tracing::{error, info, trace, warn};
 use xcursor::parser::Image;
 use xkbcommon::xkb::Keysym;
 
@@ -780,7 +781,28 @@ impl XwmHandler for State {
 
     fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
     fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
-    fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        let cleanup_pending =
+            crate::utils::env::bool_var("COSMIC_VRAM_CLEANUP_PENDING_ACTIVATIONS")
+                .unwrap_or(false);
+        if !cleanup_pending {
+            return;
+        }
+
+        let debug_enabled = crate::utils::env::bool_var("COSMIC_VRAM_DEBUG").unwrap_or(false);
+        let mut shell = self.common.shell.write();
+        let pending_activation_removed = shell
+            .pending_activations
+            .remove(&ActivationKey::X11(window.window_id()))
+            .is_some();
+        if debug_enabled {
+            info!(
+                x11_id = window.window_id(),
+                pending_activation_removed,
+                "vram_debug x11_destroyed_window",
+            );
+        }
+    }
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         if let Err(err) = window.set_mapped(true) {

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::{
-    shell::{CosmicSurface, PendingWindow, focus::target::KeyboardFocusTarget, grabs::ReleaseMode},
+    shell::{
+        ActivationKey, CosmicSurface, PendingWindow, focus::target::KeyboardFocusTarget,
+        grabs::ReleaseMode,
+    },
     utils::prelude::*,
 };
 use smithay::desktop::layer_map_for_output;
@@ -15,7 +18,10 @@ use smithay::{
     output::Output,
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
-        wayland_server::protocol::{wl_output::WlOutput, wl_seat::WlSeat},
+        wayland_server::{
+            Resource,
+            protocol::{wl_output::WlOutput, wl_seat::WlSeat},
+        },
     },
     utils::{Logical, Point, Serial},
     wayland::{
@@ -28,7 +34,7 @@ use smithay::{
     },
 };
 use std::cell::Cell;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::compositor::client_compositor_state;
 
@@ -314,15 +320,22 @@ impl XdgShellHandler for State {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let (output, clients) = {
+        let debug_enabled = crate::utils::env::bool_var("COSMIC_VRAM_DEBUG").unwrap_or(false);
+        let cleanup_pending =
+            crate::utils::env::bool_var("COSMIC_VRAM_CLEANUP_PENDING_ACTIVATIONS")
+                .unwrap_or(false);
+        let wl_surface = surface.wl_surface().clone();
+        let wl_id = wl_surface.id();
+
+        let (output, clients, debug_before, debug_after, pending_activation_removed) = {
             let mut shell = self.common.shell.write();
             let seat = shell.seats.last_active().clone();
 
-            let output = shell
-                .visible_output_for_surface(surface.wl_surface())
-                .cloned();
+            let output = shell.visible_output_for_surface(&wl_surface).cloned();
+            let debug_before =
+                debug_enabled.then(|| shell.vram_debug_counts_for_surface(&wl_surface));
             let _ = shell.unmap_surface(
-                surface.wl_surface(),
+                &wl_surface,
                 &seat,
                 &mut self.common.toplevel_info_state,
             );
@@ -330,9 +343,35 @@ impl XdgShellHandler for State {
                 shell.refresh_active_space(output);
             }
 
+            let pending_activation_removed = if cleanup_pending {
+                shell.pending_activations
+                    .remove(&ActivationKey::Wayland(wl_surface.clone()))
+                    .is_some()
+            } else {
+                false
+            };
+            let debug_after =
+                debug_enabled.then(|| shell.vram_debug_counts_for_surface(&wl_surface));
+
             // animations might be unblocked now
-            (output, shell.update_animations())
+            (
+                output,
+                shell.update_animations(),
+                debug_before,
+                debug_after,
+                pending_activation_removed,
+            )
         };
+
+        if debug_enabled {
+            info!(
+                wl_id = ?wl_id,
+                pending_activation_removed,
+                before = ?debug_before,
+                after = ?debug_after,
+                "vram_debug toplevel_destroyed",
+            );
+        }
 
         {
             let dh = self.common.display_handle.clone();

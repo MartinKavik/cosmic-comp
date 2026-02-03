@@ -46,7 +46,7 @@ use smithay::{
     output::{Output, WeakOutput},
     reexports::{
         wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
-        wayland_server::{Client, protocol::wl_surface::WlSurface},
+        wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     },
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
     wayland::{
@@ -59,7 +59,7 @@ use smithay::{
     },
     xwayland::X11Surface,
 };
-use tracing::error;
+use tracing::{error, info};
 
 use crate::{
     backend::render::animations::spring::{Spring, SpringParams},
@@ -117,6 +117,10 @@ const GESTURE_POSITION_THRESHOLD: f64 = 0.5;
 const GESTURE_VELOCITY_THRESHOLD: f64 = 0.02;
 const MOVE_GRAB_Y_OFFSET: f64 = 16.;
 const ACTIVATION_TOKEN_EXPIRE_TIME: Duration = Duration::from_secs(5);
+
+fn vram_debug_enabled() -> bool {
+    crate::utils::env::bool_var("COSMIC_VRAM_DEBUG").unwrap_or(false)
+}
 
 #[derive(Debug, Clone)]
 pub enum Trigger {
@@ -256,6 +260,14 @@ pub struct PendingLayer {
     pub surface: LayerSurface,
     pub seat: Seat<State>,
     pub output: Output,
+}
+
+#[derive(Debug)]
+pub(crate) struct VramDebugCounts {
+    mapped: bool,
+    focus_stack_refs: usize,
+    pending_windows: usize,
+    pending_activations: usize,
 }
 
 #[derive(Debug)]
@@ -1898,6 +1910,69 @@ impl Shell {
         }
     }
 
+    pub(crate) fn vram_debug_counts_for_surface(&self, surface: &WlSurface) -> VramDebugCounts {
+        let mapped = self.element_for_surface(surface).is_some();
+        let focus_stack_refs = self
+            .workspaces
+            .sets
+            .values()
+            .map(|set| {
+                set.workspaces
+                    .iter()
+                    .map(|workspace| workspace.debug_focus_stack_refs_for_surface(surface))
+                    .sum::<usize>()
+            })
+            .sum();
+        let pending_windows = self
+            .pending_windows
+            .iter()
+            .filter(|pending| pending.surface.wl_surface().as_deref() == Some(surface))
+            .count();
+        let pending_activations = self
+            .pending_activations
+            .contains_key(&ActivationKey::Wayland(surface.clone()))
+            .then_some(1)
+            .unwrap_or(0);
+
+        VramDebugCounts {
+            mapped,
+            focus_stack_refs,
+            pending_windows,
+            pending_activations,
+        }
+    }
+
+    fn vram_debug_log_unmap(&self, surface: &CosmicSurface, context: &str) {
+        if !vram_debug_enabled() {
+            return;
+        }
+
+        if let Some(wl_surface) = surface.wl_surface().as_deref() {
+            let counts = self.vram_debug_counts_for_surface(wl_surface);
+            info!(
+                context,
+                wl_id = ?wl_surface.id(),
+                mapped = counts.mapped,
+                focus_stack_refs = counts.focus_stack_refs,
+                pending_windows = counts.pending_windows,
+                pending_activations = counts.pending_activations,
+                "vram_debug unmap",
+            );
+        } else if let Some(x11_surface) = surface.x11_surface() {
+            let pending_activations = self
+                .pending_activations
+                .contains_key(&ActivationKey::X11(x11_surface.window_id()))
+                .then_some(1)
+                .unwrap_or(0);
+            info!(
+                context,
+                x11_id = x11_surface.window_id(),
+                pending_activations,
+                "vram_debug unmap",
+            );
+        }
+    }
+
     pub fn visible_output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
         if let Some(session_lock) = &self.session_lock {
             return session_lock
@@ -2942,6 +3017,7 @@ impl Shell {
 
             if let Some(surface) = surface {
                 toplevel_info.remove_toplevel(&surface);
+                self.vram_debug_log_unmap(&surface, "unmap_surface");
                 return Some(PendingWindow {
                     surface,
                     seat: seat.clone(),
