@@ -324,31 +324,45 @@ pub fn remove_from_shader_caches<R: AsGlowRenderer>(renderer: &R, keys: &[Cosmic
         return;
     }
 
+    let purge_all = crate::utils::env::bool_var("COSMIC_VRAM_CLEANUP_PURGE_ALL").unwrap_or(false);
+
     let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
         .egl_context()
         .user_data();
 
     if let Some(cache) = user_data.get::<ShadowCache>() {
         let mut cache = cache.borrow_mut();
-        for key in key_set.iter() {
-            cache.remove(key);
+        if purge_all {
+            cache.clear();
+        } else {
+            for key in key_set.iter() {
+                cache.remove(key);
+            }
         }
     }
 
     if let Some(cache) = user_data.get::<IndicatorCache>() {
         let mut cache = cache.borrow_mut();
-        cache.retain(|k, _| match k {
-            Key::Window(_, window_key) => !key_set.contains(window_key),
-            _ => true,
-        });
+        if purge_all {
+            cache.clear();
+        } else {
+            cache.retain(|k, _| match k {
+                Key::Window(_, window_key) => !key_set.contains(window_key),
+                _ => true,
+            });
+        }
     }
 
     if let Some(cache) = user_data.get::<BackdropCache>() {
         let mut cache = cache.borrow_mut();
-        cache.retain(|k, _| match k {
-            Key::Window(_, window_key) => !key_set.contains(window_key),
-            _ => true,
-        });
+        if purge_all {
+            cache.clear();
+        } else {
+            cache.retain(|k, _| match k {
+                Key::Window(_, window_key) => !key_set.contains(window_key),
+                _ => true,
+            });
+        }
     }
 }
 
