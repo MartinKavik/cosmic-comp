@@ -2,7 +2,8 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     hash::{Hash, Hasher},
-    sync::{Arc, LazyLock, Mutex, mpsc::Receiver},
+    sync::{Arc, LazyLock, Mutex, OnceLock, mpsc::Receiver},
+    time::{Duration, Instant},
 };
 
 use cosmic::{
@@ -146,6 +147,63 @@ impl<P: Program> IcedProgram for ProgramWrapper<P> {
     fn view(&self) -> cosmic::Element<'_, Self::Message> {
         self.program.view()
     }
+}
+
+fn iced_log_enabled() -> bool {
+    crate::utils::env::bool_var("VRAM_LOG")
+        .or_else(|| crate::utils::env::bool_var("COSMIC_VRAM_LOG"))
+        .unwrap_or(false)
+}
+
+fn iced_log_interval() -> Duration {
+    let ms = std::env::var("VRAM_LOG_INTERVAL_MS")
+        .ok()
+        .or_else(|| std::env::var("COSMIC_VRAM_LOG_INTERVAL_MS").ok())
+        .and_then(|val| val.parse::<u64>().ok())
+        .unwrap_or(1000);
+    Duration::from_millis(ms.max(1))
+}
+
+fn should_log_iced() -> bool {
+    if !iced_log_enabled() {
+        return false;
+    }
+    static LAST_LOG: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let interval = iced_log_interval();
+    let mut last = LAST_LOG
+        .get_or_init(|| Mutex::new(Instant::now() - interval))
+        .lock()
+        .unwrap();
+    if last.elapsed() >= interval {
+        *last = Instant::now();
+        true
+    } else {
+        false
+    }
+}
+
+fn log_iced_buffers<P: Program + Send + 'static>(internal: &IcedElementInternal<P>) {
+    if !should_log_iced() {
+        return;
+    }
+    let mut total_pixels: u64 = 0;
+    for scale in internal.buffers.keys() {
+        let buffer_size = internal
+            .size
+            .to_f64()
+            .to_buffer(**scale, Transform::Normal)
+            .to_i32_round::<i32>();
+        total_pixels += (buffer_size.w as u64).saturating_mul(buffer_size.h as u64);
+    }
+    tracing::info!(
+        buffers = internal.buffers.len(),
+        outputs = internal.outputs.len(),
+        size_w = internal.size.w,
+        size_h = internal.size.h,
+        additional_scale = internal.additional_scale,
+        total_pixels,
+        "vram_log iced buffers"
+    );
 }
 
 pub(crate) struct IcedElementInternal<P: Program + Send + 'static> {
@@ -878,6 +936,7 @@ impl<P: Program + Send + 'static> SpaceElement for IcedElement<P> {
                 ),
             );
         }
+        log_iced_buffers(internal_ref);
         internal.update(false);
     }
 }

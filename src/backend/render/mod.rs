@@ -5,8 +5,8 @@ use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
     ops::ControlFlow,
-    sync::{Arc, Weak},
-    time::Instant,
+    sync::{Arc, Mutex, OnceLock, Weak},
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "debug")]
@@ -90,6 +90,7 @@ use self::element::{AsGlowRenderer, CosmicElement};
 pub use shadow::ShadowCache;
 
 use super::kms::Timings;
+use tracing::info;
 
 pub type GlMultiRenderer<'a> =
     MultiRenderer<'a, 'a, GbmGlowBackend<DrmDeviceFd>, GbmGlowBackend<DrmDeviceFd>>;
@@ -379,6 +380,183 @@ fn maybe_purge_texture_cache<R: Renderer>(renderer: &mut R, has_pending_cleanup:
     if purge_textures {
         let _ = renderer.cleanup_texture_cache();
     }
+}
+
+#[derive(Default)]
+struct ElementCounts {
+    total: usize,
+    workspace: usize,
+    cursor: usize,
+    dnd: usize,
+    move_grab: usize,
+    damage: usize,
+    postprocess: usize,
+    zoom: usize,
+    egui: usize,
+}
+
+fn count_elements<R>(elements: &[CosmicElement<R>]) -> ElementCounts
+where
+    R: AsGlowRenderer + Renderer + ImportAll + ImportMem,
+    R::TextureId: 'static,
+    CosmicMappedRenderElement<R>: RenderElement<R>,
+{
+    let mut counts = ElementCounts::default();
+    for elem in elements {
+        counts.total += 1;
+        match elem {
+            CosmicElement::Workspace(_) => counts.workspace += 1,
+            CosmicElement::Cursor(_) => counts.cursor += 1,
+            CosmicElement::Dnd(_) => counts.dnd += 1,
+            CosmicElement::MoveGrab(_) => counts.move_grab += 1,
+            CosmicElement::AdditionalDamage(_) => counts.damage += 1,
+            CosmicElement::Postprocess(_) => counts.postprocess += 1,
+            CosmicElement::Zoom(_) => counts.zoom += 1,
+            #[cfg(feature = "debug")]
+            CosmicElement::Egui(_) => counts.egui += 1,
+        }
+    }
+    counts
+}
+
+fn vram_log_enabled() -> bool {
+    crate::utils::env::bool_var("VRAM_LOG")
+        .or_else(|| crate::utils::env::bool_var("COSMIC_VRAM_LOG"))
+        .unwrap_or(false)
+}
+
+fn vram_log_interval() -> Duration {
+    let ms = std::env::var("VRAM_LOG_INTERVAL_MS")
+        .ok()
+        .or_else(|| std::env::var("COSMIC_VRAM_LOG_INTERVAL_MS").ok())
+        .and_then(|val| val.parse::<u64>().ok())
+        .unwrap_or(1000);
+    Duration::from_millis(ms.max(1))
+}
+
+fn should_log_vram() -> bool {
+    if !vram_log_enabled() {
+        return false;
+    }
+    static LAST_LOG: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let interval = vram_log_interval();
+    let mut last = LAST_LOG
+        .get_or_init(|| Mutex::new(Instant::now() - interval))
+        .lock()
+        .unwrap();
+    if last.elapsed() >= interval {
+        *last = Instant::now();
+        true
+    } else {
+        false
+    }
+}
+
+fn shader_cache_sizes<R: AsGlowRenderer>(renderer: &R) -> (usize, usize, usize) {
+    let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+        .egl_context()
+        .user_data();
+    let shadow = user_data
+        .get::<ShadowCache>()
+        .map(|c| c.borrow().len())
+        .unwrap_or(0);
+    let indicator = user_data
+        .get::<IndicatorCache>()
+        .map(|c| c.borrow().len())
+        .unwrap_or(0);
+    let backdrop = user_data
+        .get::<BackdropCache>()
+        .map(|c| c.borrow().len())
+        .unwrap_or(0);
+    (shadow, indicator, backdrop)
+}
+
+fn maybe_log_vram_stats<R>(
+    renderer: &R,
+    shell: &Shell,
+    output: &Output,
+    elements: &[CosmicElement<R>],
+    render_states_len: Option<usize>,
+    damage_len: Option<usize>,
+    pending_cleanup_len: usize,
+    postprocess_log: Option<(Size<i32, Physical>, bool)>,
+) where
+    R: AsGlowRenderer + Renderer + ImportAll + ImportMem,
+    R::TextureId: 'static,
+    CosmicMappedRenderElement<R>: RenderElement<R>,
+{
+    if !should_log_vram() {
+        return;
+    }
+
+    let (shadow_len, indicator_len, backdrop_len) = shader_cache_sizes(renderer);
+    let counts = count_elements(elements);
+
+    let mut outputs = 0usize;
+    let mut workspaces = 0usize;
+    let mut windows = 0usize;
+    let mut set_minimized = 0usize;
+    let mut sticky_mapped = 0usize;
+    for set in shell.workspaces.sets.values() {
+        outputs += 1;
+        workspaces += set.workspaces.len();
+        set_minimized += set.minimized_windows.len();
+        sticky_mapped += set.sticky_layer.mapped().count();
+        windows += set.workspaces.iter().map(|w| w.len()).sum::<usize>();
+    }
+
+    let purge_all = crate::utils::env::bool_var("PURGE_ALL")
+        .or_else(|| crate::utils::env::bool_var("COSMIC_VRAM_CLEANUP_PURGE_ALL"))
+        .unwrap_or(false);
+    let purge_tex = crate::utils::env::bool_var("PURGE_TEX_CACHE")
+        .or_else(|| crate::utils::env::bool_var("COSMIC_VRAM_PURGE_TEXTURE_CACHE"))
+        .unwrap_or(false);
+    let hard_purge = crate::utils::env::bool_var("HARD_PURGE")
+        .or_else(|| crate::utils::env::bool_var("SMITHAY_HARD_PURGE"))
+        .unwrap_or(false);
+    let cache_log = crate::utils::env::bool_var("CACHE_LOG")
+        .or_else(|| crate::utils::env::bool_var("SMITHAY_CACHE_LOG"))
+        .unwrap_or(false);
+
+    let postprocess = postprocess_log.is_some();
+    let postprocess_size = postprocess_log.map(|(size, _)| size);
+    let postprocess_cursor = postprocess_log.map(|(_, cursor)| cursor).unwrap_or(false);
+
+    info!(
+        output = output.name(),
+        outputs,
+        workspaces,
+        windows,
+        set_minimized,
+        sticky_mapped,
+        pending_windows = shell.pending_windows.len(),
+        pending_layers = shell.pending_layers.len(),
+        pending_activations = shell.pending_activations.len(),
+        pending_cleanup_len,
+        override_redirect = shell.override_redirect_windows.len(),
+        shader_shadow = shadow_len,
+        shader_indicator = indicator_len,
+        shader_backdrop = backdrop_len,
+        elements_total = counts.total,
+        elements_workspace = counts.workspace,
+        elements_cursor = counts.cursor,
+        elements_dnd = counts.dnd,
+        elements_move_grab = counts.move_grab,
+        elements_damage = counts.damage,
+        elements_postprocess = counts.postprocess,
+        elements_zoom = counts.zoom,
+        elements_egui = counts.egui,
+        render_states = render_states_len.unwrap_or(0),
+        render_damage = damage_len.unwrap_or(0),
+        postprocess,
+        postprocess_size = ?postprocess_size,
+        postprocess_cursor,
+        purge_all,
+        purge_tex,
+        hard_purge,
+        cache_log,
+        "vram_log"
+    );
 }
 
 impl BackdropShader {
@@ -1281,6 +1459,7 @@ where
         let mut shell_guard = shell.write();
         std::mem::take(&mut shell_guard.pending_shader_cleanup)
     };
+    let pending_cleanup_len = pending_cleanup.len();
     remove_from_shader_caches(renderer, &pending_cleanup);
     maybe_purge_texture_cache(renderer, !pending_cleanup.is_empty());
 
@@ -1304,6 +1483,7 @@ where
     };
 
     let mut postprocess_texture = None;
+    let mut postprocess_log: Option<(Size<i32, Physical>, bool)> = None;
     let result = if !screen_filter.filter.is_noop() {
         if screen_filter.state.as_ref().is_none_or(|state| {
             state.output_config != PostprocessOutputConfig::for_output_untransformed(output)
@@ -1319,6 +1499,7 @@ where
         }
 
         let state = screen_filter.state.as_mut().unwrap();
+        postprocess_log = Some((state.output_config.size, state.cursor_texture.is_some()));
         let mut result = Err(RenderError::OutputNoMode(OutputNoMode));
         state
             .texture
@@ -1449,6 +1630,20 @@ where
 
     match result {
         Ok((res, mut elements)) => {
+            let render_states_len = Some(res.states.states.len());
+            let damage_len = res.damage.as_ref().map(|d| d.len());
+            let shell_ref = shell.read();
+            maybe_log_vram_stats(
+                renderer,
+                &shell_ref,
+                output,
+                &elements,
+                render_states_len,
+                damage_len,
+                pending_cleanup_len,
+                postprocess_log,
+            );
+
             for (session, frame) in output.take_pending_frames() {
                 if let Some(pending_image_copy_data) = render_session::<_, _, GlesTexture>(
                     renderer,
