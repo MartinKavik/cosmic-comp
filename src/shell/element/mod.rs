@@ -140,6 +140,12 @@ impl Hash for CosmicMappedKey {
     }
 }
 
+impl std::fmt::Debug for CosmicMappedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CosmicMappedKey")
+    }
+}
+
 impl IsAlive for CosmicMappedKey {
     fn alive(&self) -> bool {
         match &self.0 {

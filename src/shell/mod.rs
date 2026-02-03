@@ -12,7 +12,10 @@ use std::{
 use wayland_backend::server::ClientId;
 
 use crate::{
-    shell::{focus::FocusTarget, grabs::fullscreen_items, layout::tiling::PlaceholderType},
+    shell::{
+        element::CosmicMappedKey, focus::FocusTarget, grabs::fullscreen_items,
+        layout::tiling::PlaceholderType,
+    },
     wayland::{
         handlers::data_device::{self, get_dnd_icon},
         protocols::workspace::{State as WState, WorkspaceCapabilities},
@@ -277,6 +280,7 @@ pub struct Shell {
     pub pending_windows: Vec<PendingWindow>,
     pub pending_layers: Vec<PendingLayer>,
     pub pending_activations: HashMap<ActivationKey, ActivationContext>,
+    pub pending_shader_cleanup: Vec<CosmicMappedKey>,
     pub override_redirect_windows: Vec<X11Surface>,
     pub session_lock: Option<SessionLock>,
     pub seats: Seats,
@@ -1594,6 +1598,7 @@ impl Shell {
             pending_windows: Vec::new(),
             pending_layers: Vec::new(),
             pending_activations: HashMap::new(),
+            pending_shader_cleanup: Vec::new(),
             override_redirect_windows: Vec::new(),
             session_lock: None,
             previous_workspace_idx: None,
@@ -2962,6 +2967,14 @@ impl Shell {
     where
         CosmicSurface: PartialEq<S>,
     {
+        let cleanup_key = self.element_for_surface(surface).and_then(|mapped| {
+            if mapped.stack_ref().is_some_and(|stack| stack.len() > 1) {
+                None
+            } else {
+                Some(mapped.key())
+            }
+        });
+
         for set in self.workspaces.sets.values_mut() {
             let sticky_res = set.sticky_layer.mapped().find_map(|m| {
                 m.windows()
@@ -3018,6 +3031,9 @@ impl Shell {
             if let Some(surface) = surface {
                 toplevel_info.remove_toplevel(&surface);
                 self.vram_debug_log_unmap(&surface, "unmap_surface");
+                if let Some(key) = cleanup_key.as_ref() {
+                    self.pending_shader_cleanup.push(key.clone());
+                }
                 return Some(PendingWindow {
                     surface,
                     seat: seat.clone(),
