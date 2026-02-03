@@ -368,6 +368,19 @@ pub fn remove_from_shader_caches<R: AsGlowRenderer>(renderer: &R, keys: &[Cosmic
     }
 }
 
+fn maybe_purge_texture_cache<R: Renderer>(renderer: &mut R, has_pending_cleanup: bool) {
+    if !has_pending_cleanup {
+        return;
+    }
+
+    let purge_textures = crate::utils::env::bool_var("PURGE_TEX_CACHE")
+        .or_else(|| crate::utils::env::bool_var("COSMIC_VRAM_PURGE_TEXTURE_CACHE"))
+        .unwrap_or(false);
+    if purge_textures {
+        let _ = renderer.cleanup_texture_cache();
+    }
+}
+
 impl BackdropShader {
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
         Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
@@ -1269,6 +1282,7 @@ where
         std::mem::take(&mut shell_guard.pending_shader_cleanup)
     };
     remove_from_shader_caches(renderer, &pending_cleanup);
+    maybe_purge_texture_cache(renderer, !pending_cleanup.is_empty());
 
     let shell_ref = shell.read();
     let (previous_workspace, workspace) = shell_ref
