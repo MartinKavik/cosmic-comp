@@ -324,7 +324,9 @@ pub fn remove_from_shader_caches<R: AsGlowRenderer>(renderer: &R, keys: &[Cosmic
         return;
     }
 
-    let purge_all = crate::utils::env::bool_var("COSMIC_VRAM_CLEANUP_PURGE_ALL").unwrap_or(false);
+    let purge_all = crate::utils::env::bool_var("PURGE_ALL")
+        .or_else(|| crate::utils::env::bool_var("COSMIC_VRAM_CLEANUP_PURGE_ALL"))
+        .unwrap_or(false);
 
     let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
         .egl_context()
