@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::{
-    shell::{CosmicSurface, PendingWindow, focus::target::KeyboardFocusTarget, grabs::ReleaseMode},
+    shell::{
+        ActivationKey, CosmicSurface, PendingWindow, focus::target::KeyboardFocusTarget,
+        grabs::ReleaseMode,
+    },
     utils::prelude::*,
 };
 use smithay::desktop::layer_map_for_output;
@@ -321,6 +324,9 @@ impl XdgShellHandler for State {
             let output = shell
                 .visible_output_for_surface(surface.wl_surface())
                 .cloned();
+            shell
+                .pending_activations
+                .remove(&ActivationKey::Wayland(surface.wl_surface().clone()));
             let _ = shell.unmap_surface(
                 surface.wl_surface(),
                 &seat,

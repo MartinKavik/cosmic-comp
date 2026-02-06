@@ -1039,7 +1039,6 @@ impl SurfaceThreadState {
                 (false, false, animations_going)
             }
         };
-
         if has_active_fullscreen || animations_going {
             // skip overlay plane assign if we have a fullscreen surface or dynamic contents to save on tests
             remove_frame_flags |= FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT;

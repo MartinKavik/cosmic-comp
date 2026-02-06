@@ -140,6 +140,23 @@ impl Hash for CosmicMappedKey {
     }
 }
 
+impl std::fmt::Debug for CosmicMappedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            CosmicMappedKeyInner::Window(weak) => {
+                f.debug_tuple("CosmicMappedKey::Window")
+                    .field(&weak.as_ptr())
+                    .finish()
+            }
+            CosmicMappedKeyInner::Stack(weak) => {
+                f.debug_tuple("CosmicMappedKey::Stack")
+                    .field(&weak.as_ptr())
+                    .finish()
+            }
+        }
+    }
+}
+
 impl IsAlive for CosmicMappedKey {
     fn alive(&self) -> bool {
         match &self.0 {

@@ -9,7 +9,8 @@ use std::{
 use crate::{
     backend::render::cursor::{Cursor, load_cursor_env, load_cursor_theme},
     shell::{
-        CosmicSurface, PendingWindow, Shell, focus::target::KeyboardFocusTarget, grabs::ReleaseMode,
+        ActivationKey, CosmicSurface, PendingWindow, Shell, focus::target::KeyboardFocusTarget,
+        grabs::ReleaseMode,
     },
     state::State,
     utils::prelude::*,
@@ -780,7 +781,12 @@ impl XwmHandler for State {
 
     fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
     fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
-    fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        let mut shell = self.common.shell.write();
+        shell
+            .pending_activations
+            .remove(&ActivationKey::X11(window.window_id()));
+    }
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         if let Err(err) = window.set_mapped(true) {

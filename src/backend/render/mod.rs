@@ -3,7 +3,7 @@
 use std::{
     borrow::Borrow,
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::ControlFlow,
     sync::{Arc, Weak},
     time::Instant,
@@ -87,6 +87,7 @@ pub mod cursor;
 pub mod element;
 pub mod shadow;
 use self::element::{AsGlowRenderer, CosmicElement};
+use shadow::ShadowCache;
 
 use super::kms::Timings;
 
@@ -310,6 +311,43 @@ struct BackdropSettings {
     color: [f32; 3],
 }
 type BackdropCache = RefCell<HashMap<Key, (BackdropSettings, PixelShaderElement)>>;
+
+/// Remove specific window keys from shader element caches.
+/// Called during render to process pending cleanup requests.
+pub fn remove_from_shader_caches<R: AsGlowRenderer>(renderer: &R, keys: &[CosmicMappedKey]) {
+    if keys.is_empty() {
+        return;
+    }
+
+    let key_set: HashSet<CosmicMappedKey> = keys.iter().cloned().collect();
+
+    let user_data = Borrow::<GlesRenderer>::borrow(renderer.glow_renderer())
+        .egl_context()
+        .user_data();
+
+    if let Some(cache) = user_data.get::<ShadowCache>() {
+        let mut cache = cache.borrow_mut();
+        for key in key_set.iter() {
+            cache.remove(key);
+        }
+    }
+
+    if let Some(cache) = user_data.get::<IndicatorCache>() {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|k, _| match k {
+            Key::Window(_, window_key) => !key_set.contains(window_key),
+            _ => true,
+        });
+    }
+
+    if let Some(cache) = user_data.get::<BackdropCache>() {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|k, _| match k {
+            Key::Window(_, window_key) => !key_set.contains(window_key),
+            _ => true,
+        });
+    }
+}
 
 impl BackdropShader {
     pub fn get<R: AsGlowRenderer>(renderer: &R) -> GlesPixelProgram {
@@ -1207,6 +1245,12 @@ where
     CosmicMappedRenderElement<R>: RenderElement<R>,
     WorkspaceRenderElement<R>: RenderElement<R>,
 {
+    let pending_cleanup = {
+        let mut shell_guard = shell.write();
+        std::mem::take(&mut shell_guard.pending_shader_cleanup)
+    };
+    remove_from_shader_caches(renderer, &pending_cleanup);
+
     let shell_ref = shell.read();
     let (previous_workspace, workspace) = shell_ref
         .workspaces
