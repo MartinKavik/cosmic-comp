@@ -365,6 +365,12 @@ where
                 {
                     handle.closed();
                 }
+                // Release the window reference held in the handle's user data.
+                // The protocol object may outlive this call (client still holds it),
+                // so we must clear the window to avoid leaking Arc<WindowInner>.
+                if let Some(handle_state) = handle.data::<ToplevelHandleState<W>>() {
+                    handle_state.lock().unwrap().window = None;
+                }
             }
             if let Some(handle) = state_inner.foreign_handle.take() {
                 self.foreign_toplevel_list.remove_toplevel(&handle);
@@ -410,6 +416,10 @@ where
                             .any(|i| i.id().same_client_as(&handle.id()))
                     {
                         handle.closed();
+                    }
+                    // Release the window reference held in the handle's user data.
+                    if let Some(handle_state) = handle.data::<ToplevelHandleState<W>>() {
+                        handle_state.lock().unwrap().window = None;
                     }
                 }
                 dirty = true;
