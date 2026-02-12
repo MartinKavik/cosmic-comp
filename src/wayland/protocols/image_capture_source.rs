@@ -1,7 +1,7 @@
 use super::{
     workspace::{WorkspaceHandle, WorkspaceHandler},
 };
-use crate::shell::element::surface::WeakCosmicSurface;
+use crate::shell::WeakCosmicSurface;
 use cosmic_protocols::image_capture_source::v1::server::{
     zcosmic_workspace_image_capture_source_manager_v1::{
         Request as CosmicWorkspaceSourceRequest, ZcosmicWorkspaceImageCaptureSourceManagerV1,
