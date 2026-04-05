@@ -1286,13 +1286,15 @@ impl Common {
             }
         };
         const THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
-        const SCREENCOPY_THROTTLE: Option<Duration> = Some(Duration::from_nanos(16_666_666));
+        // 30 FPS is sufficient for active capture while avoiding the 60 FPS
+        // callback pressure that kept the compositor busy on multi-display setups.
+        const SCREENCOPY_THROTTLE: Option<Duration> = Some(Duration::from_nanos(33_333_333));
 
         fn throttle(session_holder: &impl SessionHolder) -> Option<Duration> {
-            if session_holder.sessions().is_empty() && session_holder.cursor_sessions().is_empty() {
-                THROTTLE
-            } else {
+            if session_holder.is_capture_active() {
                 SCREENCOPY_THROTTLE
+            } else {
+                THROTTLE
             }
         }
 

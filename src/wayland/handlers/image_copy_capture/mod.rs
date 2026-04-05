@@ -289,16 +289,32 @@ impl ImageCopyCaptureHandler for State {
                     return;
                 };
 
-                output.add_frame(session.clone(), frame);
-                self.backend.schedule_render(&output);
+                output.mark_capture_active();
+                let queue_was_empty = output.add_frame(session.clone(), frame);
+
+                // Wake the render loop once when the queue transitions from
+                // idle to active without forcing a redraw for every request.
+                if queue_was_empty {
+                    self.backend.schedule_render(&output);
+                }
             }
             ImageCaptureSourceKind::Workspace(handle) => {
+                if let Some(workspace) = self
+                    .common
+                    .shell
+                    .read()
+                    .workspaces
+                    .space_for_handle(&handle)
+                {
+                    workspace.mark_capture_active();
+                }
                 render_workspace_to_buffer(self, session, frame, handle)
             }
             ImageCaptureSourceKind::Toplevel(weak) => {
                 let Some(toplevel) = weak.upgrade() else {
                     return;
                 };
+                toplevel.mark_capture_active();
                 render_window_to_buffer(self, session, frame, &toplevel)
             }
             ImageCaptureSourceKind::Destroyed => {

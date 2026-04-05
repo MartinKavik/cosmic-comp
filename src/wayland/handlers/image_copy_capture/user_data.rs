@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{cell::RefCell, sync::Mutex};
+use std::{
+    cell::RefCell,
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use smithay::{
     backend::renderer::{
@@ -41,6 +48,28 @@ impl SessionUserData {
 pub struct ImageCopySessions {
     sessions: Vec<Session>,
     cursor_sessions: Vec<CursorSession>,
+    // Long-lived screencopy sessions may stay open while idle. Track recent
+    // frame requests so only active captures affect the fast callback path.
+    last_frame_request_ms: AtomicU64,
+}
+
+const CAPTURE_ACTIVE_TIMEOUT_MS: u64 = 1_000;
+static MONOTONIC_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn current_time_ms() -> u64 {
+    MONOTONIC_EPOCH.elapsed().as_millis() as u64
+}
+
+impl ImageCopySessions {
+    pub fn mark_capture_active(&self) {
+        self.last_frame_request_ms
+            .store(current_time_ms(), Ordering::Relaxed);
+    }
+
+    pub fn is_capture_active(&self) -> bool {
+        let last = self.last_frame_request_ms.load(Ordering::Relaxed);
+        last != 0 && current_time_ms().saturating_sub(last) < CAPTURE_ACTIVE_TIMEOUT_MS
+    }
 }
 
 /// Drop all capture sessions stored in the given `UserDataMap`.
@@ -70,10 +99,13 @@ pub trait SessionHolder {
     fn add_cursor_session(&mut self, session: CursorSession);
     fn remove_cursor_session(&mut self, session: &CursorSessionRef);
     fn cursor_sessions(&self) -> Vec<CursorSessionRef>;
+
+    fn mark_capture_active(&self);
+    fn is_capture_active(&self) -> bool;
 }
 
 pub trait FrameHolder {
-    fn add_frame(&mut self, session: SessionRef, frame: Frame);
+    fn add_frame(&mut self, session: SessionRef, frame: Frame) -> bool;
     fn remove_frame(&mut self, frame: &FrameRef);
     fn take_pending_frames(&self) -> Vec<(SessionRef, Frame)>;
 }
@@ -91,12 +123,9 @@ impl SessionHolder for Output {
     }
 
     fn remove_session(&mut self, session: &SessionRef) {
-        self.user_data()
-            .get::<ImageCopySessionsData>()
-            .unwrap()
-            .borrow_mut()
-            .sessions
-            .retain(|s| s != session);
+        if let Some(data) = self.user_data().get::<ImageCopySessionsData>() {
+            data.borrow_mut().sessions.retain(|s| s != session);
+        }
     }
 
     fn sessions(&self) -> Vec<SessionRef> {
@@ -124,12 +153,9 @@ impl SessionHolder for Output {
     }
 
     fn remove_cursor_session(&mut self, session: &CursorSessionRef) {
-        self.user_data()
-            .get::<ImageCopySessionsData>()
-            .unwrap()
-            .borrow_mut()
-            .cursor_sessions
-            .retain(|s| s != session);
+        if let Some(data) = self.user_data().get::<ImageCopySessionsData>() {
+            data.borrow_mut().cursor_sessions.retain(|s| s != session);
+        }
     }
 
     fn cursor_sessions(&self) -> Vec<CursorSessionRef> {
@@ -144,18 +170,33 @@ impl SessionHolder for Output {
                     .collect()
             })
     }
+
+    fn mark_capture_active(&self) {
+        if let Some(data) = self.user_data().get::<ImageCopySessionsData>() {
+            data.borrow().mark_capture_active();
+        }
+    }
+
+    fn is_capture_active(&self) -> bool {
+        self.user_data()
+            .get::<ImageCopySessionsData>()
+            .map_or(false, |data| data.borrow().is_capture_active())
+    }
 }
 
 impl FrameHolder for Output {
-    fn add_frame(&mut self, session: SessionRef, frame: Frame) {
+    fn add_frame(&mut self, session: SessionRef, frame: Frame) -> bool {
         self.user_data()
             .insert_if_missing_threadsafe(PendingImageCopyBuffers::default);
-        self.user_data()
+        let mut pending = self
+            .user_data()
             .get::<PendingImageCopyBuffers>()
             .unwrap()
             .lock()
-            .unwrap()
-            .push((session, frame));
+            .unwrap();
+        let was_empty = pending.is_empty();
+        pending.push((session, frame));
+        was_empty
     }
     fn remove_frame(&mut self, frame: &FrameRef) {
         if let Some(pending) = self.user_data().get::<PendingImageCopyBuffers>() {
@@ -200,6 +241,14 @@ impl SessionHolder for Workspace {
             .map(|s| (*s).clone())
             .collect()
     }
+
+    fn mark_capture_active(&self) {
+        self.image_copy.mark_capture_active();
+    }
+
+    fn is_capture_active(&self) -> bool {
+        self.image_copy.is_capture_active()
+    }
 }
 
 impl SessionHolder for CosmicSurface {
@@ -215,12 +264,9 @@ impl SessionHolder for CosmicSurface {
     }
 
     fn remove_session(&mut self, session: &SessionRef) {
-        self.user_data()
-            .get::<ImageCopySessionsData>()
-            .unwrap()
-            .borrow_mut()
-            .sessions
-            .retain(|s| s != session);
+        if let Some(data) = self.user_data().get::<ImageCopySessionsData>() {
+            data.borrow_mut().sessions.retain(|s| s != session);
+        }
     }
     fn sessions(&self) -> Vec<SessionRef> {
         self.user_data()
@@ -247,12 +293,9 @@ impl SessionHolder for CosmicSurface {
     }
 
     fn remove_cursor_session(&mut self, session: &CursorSessionRef) {
-        self.user_data()
-            .get::<ImageCopySessionsData>()
-            .unwrap()
-            .borrow_mut()
-            .cursor_sessions
-            .retain(|s| s != session);
+        if let Some(data) = self.user_data().get::<ImageCopySessionsData>() {
+            data.borrow_mut().cursor_sessions.retain(|s| s != session);
+        }
     }
 
     fn cursor_sessions(&self) -> Vec<CursorSessionRef> {
@@ -266,5 +309,17 @@ impl SessionHolder for CosmicSurface {
                     .map(|s| (*s).clone())
                     .collect()
             })
+    }
+
+    fn mark_capture_active(&self) {
+        if let Some(data) = self.user_data().get::<ImageCopySessionsData>() {
+            data.borrow().mark_capture_active();
+        }
+    }
+
+    fn is_capture_active(&self) -> bool {
+        self.user_data()
+            .get::<ImageCopySessionsData>()
+            .map_or(false, |data| data.borrow().is_capture_active())
     }
 }
