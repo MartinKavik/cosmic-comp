@@ -874,16 +874,6 @@ impl CosmicSurface {
     pub fn x11_surface(&self) -> Option<&X11Surface> {
         self.0.x11_surface()
     }
-
-    pub fn downgrade(&self) -> WeakCosmicSurface {
-        WeakCosmicSurface(self.0.downgrade())
-    }
-}
-
-impl WeakCosmicSurface {
-    pub fn upgrade(&self) -> Option<CosmicSurface> {
-        self.0.upgrade().map(CosmicSurface)
-    }
 }
 
 impl IsAlive for CosmicSurface {
