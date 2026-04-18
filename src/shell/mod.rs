@@ -2063,19 +2063,26 @@ impl Shell {
         CosmicSurface: PartialEq<S>,
     {
         self.workspaces.sets.values().find_map(|set| {
-            set.minimized_windows
-                .iter()
-                .find(|w| w.windows().any(|s| &s == surface))
-                .and_then(|w| w.mapped())
+            set.workspaces
+                .get(set.active)
+                .and_then(|w| w.element_for_surface(surface))
                 .or_else(|| {
                     set.sticky_layer
                         .mapped()
                         .find(|w| w.windows().any(|(s, _)| &s == surface))
                 })
                 .or_else(|| {
+                    set.minimized_windows
+                        .iter()
+                        .find(|w| w.windows().any(|s| &s == surface))
+                        .and_then(|w| w.mapped())
+                })
+                .or_else(|| {
                     set.workspaces
                         .iter()
-                        .find_map(|w| w.element_for_surface(surface))
+                        .enumerate()
+                        .filter(|(idx, _)| *idx != set.active)
+                        .find_map(|(_, w)| w.element_for_surface(surface))
                 })
         })
     }
