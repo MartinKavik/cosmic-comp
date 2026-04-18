@@ -1903,6 +1903,14 @@ impl Shell {
     }
 
     pub fn visible_output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
+        if let Some(primary_output) = with_states(surface, |states| {
+            surface_primary_scanout_output(surface, states)
+        }) {
+            if let Some(output) = self.outputs().find(|output| **output == primary_output) {
+                return Some(output);
+            }
+        }
+
         if let Some(session_lock) = &self.session_lock {
             return session_lock
                 .surfaces
