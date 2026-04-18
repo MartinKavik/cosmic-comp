@@ -96,7 +96,7 @@ use self::zoom::{OutputZoomState, ZoomState};
 
 use self::{
     element::{
-        CosmicWindow, MaximizedState,
+        CosmicMappedKey, CosmicWindow, MaximizedState,
         resize_indicator::{ResizeIndicator, resize_indicator},
         swap_indicator::{SwapIndicator, swap_indicator},
     },
@@ -117,6 +117,24 @@ const GESTURE_POSITION_THRESHOLD: f64 = 0.5;
 const GESTURE_VELOCITY_THRESHOLD: f64 = 0.02;
 const MOVE_GRAB_Y_OFFSET: f64 = 16.;
 const ACTIVATION_TOKEN_EXPIRE_TIME: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct SurfaceCommitLookupCache {
+    output: Mutex<Option<WeakOutput>>,
+    element: Mutex<Option<CosmicMappedKey>>,
+}
+
+fn with_surface_commit_lookup_cache<T>(
+    surface: &WlSurface,
+    f: impl FnOnce(&SurfaceCommitLookupCache) -> T,
+) -> T {
+    with_states(surface, |states| {
+        let cache = states
+            .data_map
+            .get_or_insert_threadsafe::<SurfaceCommitLookupCache, _>(Default::default);
+        f(cache)
+    })
+}
 
 #[derive(Debug, Clone)]
 pub enum Trigger {
@@ -1558,7 +1576,7 @@ impl Common {
                 });
             }
 
-            if let Some(mapped) = shell.element_for_surface(surface) {
+            if let Some(mapped) = shell.cached_element_for_surface(surface) {
                 mapped.on_commit(surface);
             }
             if let Some(surface) = shell
@@ -1902,132 +1920,207 @@ impl Shell {
         }
     }
 
+    fn update_surface_lookup_output_cache(surface: &WlSurface, output: &Output) {
+        with_surface_commit_lookup_cache(surface, |cache| {
+            *cache.output.lock().unwrap() = Some(output.downgrade());
+        });
+    }
+
+    fn update_surface_lookup_element_cache(surface: &WlSurface, mapped: &CosmicMapped) {
+        with_surface_commit_lookup_cache(surface, |cache| {
+            *cache.element.lock().unwrap() = Some(mapped.key());
+        });
+    }
+
+    fn cached_output_hint_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
+        let cached = with_surface_commit_lookup_cache(surface, |cache| {
+            cache.output.lock().unwrap().clone()
+        });
+
+        let Some(output) = cached
+            .and_then(|output| output.upgrade())
+            .and_then(|output| self.outputs().find(|candidate| **candidate == output))
+        else {
+            with_surface_commit_lookup_cache(surface, |cache| {
+                *cache.output.lock().unwrap() = None;
+            });
+            return None;
+        };
+
+        if self.surface_visible_on_output(surface, output) {
+            Some(output)
+        } else {
+            with_surface_commit_lookup_cache(surface, |cache| {
+                *cache.output.lock().unwrap() = None;
+            });
+            None
+        }
+    }
+
+    fn cached_element_hint_for_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
+        let cached = with_surface_commit_lookup_cache(surface, |cache| {
+            cache.element.lock().unwrap().clone()
+        });
+
+        let Some(mapped) = cached.and_then(|key| {
+            self.mapped()
+                .find(|mapped| mapped.key() == key && mapped.has_toplevel_surface(surface))
+        }) else {
+            with_surface_commit_lookup_cache(surface, |cache| {
+                *cache.element.lock().unwrap() = None;
+            });
+            return None;
+        };
+
+        Some(mapped)
+    }
+
+    fn surface_visible_on_output(&self, surface: &WlSurface, output: &Output) -> bool {
+        let map = layer_map_for_output(output);
+        if map
+            .layer_for_surface(surface, WindowSurfaceType::ALL)
+            .is_some()
+        {
+            return true;
+        }
+
+        if self
+            .pending_layers
+            .iter()
+            .filter(|pending| pending.output == *output)
+            .any(|pending| {
+                let mut found = false;
+                pending.surface.with_surfaces(|s, _| {
+                    if s == surface {
+                        found = true;
+                    }
+                });
+                found
+            })
+        {
+            return true;
+        }
+
+        if self.override_redirect_windows.iter().any(|or| {
+            or.wl_surface().as_ref() == Some(surface)
+                && or
+                    .geometry()
+                    .as_global()
+                    .intersection(output.geometry())
+                    .is_some()
+        }) {
+            return true;
+        }
+
+        let Some(set) = self.workspaces.sets.get(output) else {
+            return false;
+        };
+
+        if set
+            .sticky_layer
+            .mapped()
+            .any(|mapped| mapped.has_toplevel_surface(surface))
+            || set
+                .sticky_layer
+                .mapped()
+                .any(|mapped| mapped.has_surface(surface, WindowSurfaceType::ALL))
+        {
+            return true;
+        }
+
+        let workspace = &set.workspaces[set.active];
+        if workspace
+            .get_fullscreen()
+            .is_some_and(|window| window.has_surface(surface, WindowSurfaceType::TOPLEVEL))
+            || workspace
+                .mapped()
+                .any(|mapped| mapped.has_toplevel_surface(surface))
+            || workspace
+                .get_fullscreen()
+                .is_some_and(|window| window.has_surface(surface, WindowSurfaceType::ALL))
+            || workspace
+                .mapped()
+                .any(|mapped| mapped.has_surface(surface, WindowSurfaceType::ALL))
+        {
+            return true;
+        }
+
+        self.seats
+            .iter()
+            .filter(|seat| seat.active_output() == *output)
+            .any(|seat| {
+                let cursor_status = seat.cursor_image_status();
+                if let CursorImageStatus::Surface(cursor_surface) = cursor_status
+                    && cursor_surface == *surface
+                {
+                    return true;
+                }
+
+                if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
+                    && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
+                {
+                    for (window, _) in grab_state.element().windows() {
+                        let mut matches = false;
+                        window.0.with_surfaces(|s, _| {
+                            matches |= s == surface;
+                        });
+                        if matches {
+                            return true;
+                        }
+                    }
+                }
+
+                get_dnd_icon(seat).is_some_and(|icon| icon.surface == *surface)
+            })
+    }
+
     pub fn visible_output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
         if let Some(primary_output) = with_states(surface, |states| {
             surface_primary_scanout_output(surface, states)
         }) {
             if let Some(output) = self.outputs().find(|output| **output == primary_output) {
+                Self::update_surface_lookup_output_cache(surface, output);
                 return Some(output);
             }
         }
 
         if let Some(session_lock) = &self.session_lock {
-            return session_lock
+            let output = session_lock
                 .surfaces
                 .iter()
                 .find(|(_, v)| v.wl_surface() == surface)
                 .map(|(k, _)| k);
+            if let Some(output) = output {
+                Self::update_surface_lookup_output_cache(surface, output);
+            }
+            return output;
         }
 
-        self.outputs()
-            // layer map surface?
-            .find(|o| {
-                let map = layer_map_for_output(o);
-                map.layer_for_surface(surface, WindowSurfaceType::ALL)
-                    .is_some()
-            })
-            // pending layer map surface?
-            .or_else(|| {
-                self.pending_layers.iter().find_map(|pending| {
-                    let mut found = false;
-                    pending.surface.with_surfaces(|s, _| {
-                        if s == surface {
-                            found = true;
-                        }
-                    });
-                    found.then_some(&pending.output)
-                })
-            })
-            // override redirect window?
-            .or_else(|| {
-                self.outputs().find(|o| {
-                    self.override_redirect_windows.iter().any(|or| {
-                        if or.wl_surface().as_ref() == Some(surface) {
-                            or.geometry()
-                                .as_global()
-                                .intersection(o.geometry())
-                                .is_some()
-                        } else {
-                            false
-                        }
-                    })
-                })
-            })
-            // sticky window ?
-            .or_else(|| {
-                self.outputs().find(|o| {
-                    self.workspaces.sets[*o]
-                        .sticky_layer
-                        .mapped()
-                        .any(|e| e.has_toplevel_surface(surface))
-                })
-            })
-            .or_else(|| {
-                self.outputs().find(|o| {
-                    let workspace = self.active_space(o).unwrap();
+        if let Some(output) = self.cached_output_hint_for_surface(surface) {
+            return Some(output);
+        }
 
-                    workspace
-                        .get_fullscreen()
-                        .is_some_and(|s| s.has_surface(surface, WindowSurfaceType::TOPLEVEL))
-                        || workspace
-                            .mapped()
-                            .any(|e| e.has_toplevel_surface(surface))
-                })
-            })
-            // sticky window ?
-            .or_else(|| {
-                self.outputs().find(|o| {
-                    self.workspaces.sets[*o]
-                        .sticky_layer
-                        .mapped()
-                        .any(|e| e.has_surface(surface, WindowSurfaceType::ALL))
-                })
-            })
-            // normal window?
-            .or_else(|| {
-                self.outputs().find(|o| {
-                    let workspace = self.active_space(o).unwrap();
+        let output = self
+            .outputs()
+            .find(|output| self.surface_visible_on_output(surface, output));
 
-                    workspace
-                        .get_fullscreen()
-                        .is_some_and(|s| s.has_surface(surface, WindowSurfaceType::ALL))
-                        || workspace
-                            .mapped()
-                            .any(|e| e.has_surface(surface, WindowSurfaceType::ALL))
-                })
-            })
-            // cursor and drag surfaces
-            .or_else(|| {
-                self.outputs().find(|o| {
-                    self.seats
-                        .iter()
-                        .filter(|seat| seat.active_output() == **o)
-                        .any(|seat| {
-                            let cursor_status = seat.cursor_image_status();
-                            if let CursorImageStatus::Surface(s) = cursor_status
-                                && s == *surface
-                            {
-                                return true;
-                            }
+        if let Some(output) = output {
+            Self::update_surface_lookup_output_cache(surface, output);
+        }
 
-                            if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
-                                && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
-                            {
-                                for (window, _) in grab_state.element().windows() {
-                                    let mut matches = false;
-                                    window.0.with_surfaces(|s, _| {
-                                        matches |= s == surface;
-                                    });
-                                    if matches {
-                                        return true;
-                                    }
-                                }
-                            }
+        output
+    }
 
-                            get_dnd_icon(seat).is_some_and(|icon| icon.surface == *surface)
-                        })
-                })
-            })
+    pub fn cached_element_for_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
+        if let Some(mapped) = self.cached_element_hint_for_surface(surface) {
+            return Some(mapped);
+        }
+
+        let mapped = self.element_for_surface(surface);
+        if let Some(mapped) = mapped {
+            Self::update_surface_lookup_element_cache(surface, mapped);
+        }
+        mapped
     }
 
     pub fn workspace_for_surface(&self, surface: &WlSurface) -> Option<(WorkspaceHandle, Output)> {
@@ -2088,12 +2181,22 @@ impl Shell {
     }
 
     pub fn resizing_element_for_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
-        self.mapped().find(|mapped| {
+        if let Some(mapped) = self.cached_element_hint_for_surface(surface)
+            && mapped.resize_state.lock().unwrap().is_some()
+        {
+            return Some(mapped);
+        }
+
+        let mapped = self.mapped().find(|mapped| {
             mapped.resize_state.lock().unwrap().is_some()
                 && mapped
                     .windows()
                     .any(|(window, _)| window.wl_surface().as_deref() == Some(surface))
-        })
+        });
+        if let Some(mapped) = mapped {
+            Self::update_surface_lookup_element_cache(surface, mapped);
+        }
+        mapped
     }
 
     pub fn is_surface_mapped<S>(&self, surface: &S) -> bool
