@@ -1959,6 +1959,27 @@ impl Shell {
                     self.workspaces.sets[*o]
                         .sticky_layer
                         .mapped()
+                        .any(|e| e.has_toplevel_surface(surface))
+                })
+            })
+            .or_else(|| {
+                self.outputs().find(|o| {
+                    let workspace = self.active_space(o).unwrap();
+
+                    workspace
+                        .get_fullscreen()
+                        .is_some_and(|s| s.has_surface(surface, WindowSurfaceType::TOPLEVEL))
+                        || workspace
+                            .mapped()
+                            .any(|e| e.has_toplevel_surface(surface))
+                })
+            })
+            // sticky window ?
+            .or_else(|| {
+                self.outputs().find(|o| {
+                    self.workspaces.sets[*o]
+                        .sticky_layer
+                        .mapped()
                         .any(|e| e.has_surface(surface, WindowSurfaceType::ALL))
                 })
             })

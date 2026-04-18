@@ -252,6 +252,11 @@ impl CosmicMapped {
             .any(|(w, _)| w.has_surface(surface, surface_type))
     }
 
+    pub fn has_toplevel_surface(&self, surface: &WlSurface) -> bool {
+        self.windows()
+            .any(|(window, _)| window.wl_surface().as_deref() == Some(surface))
+    }
+
     /// Give the pointer target under a relative offset into this element.
     ///
     /// Returns Target + Offset relative to the target
