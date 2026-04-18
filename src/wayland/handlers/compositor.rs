@@ -343,9 +343,9 @@ impl CompositorHandler for State {
             // If we would re-position the window inside the grab we would get a weird jittery animation.
             // We only want to resize once the client has acknoledged & commited the new size,
             // so we need to carefully track the state through different handlers.
-            if let Some(element) = shell.element_for_surface(surface).cloned() {
+            if let Some(element) = shell.resizing_element_for_surface(surface).cloned() {
                 crate::shell::layout::floating::ResizeSurfaceGrab::apply_resize_to_location(
-                    element.clone(),
+                    element,
                     &mut shell,
                 );
             }

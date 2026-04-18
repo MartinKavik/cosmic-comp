@@ -2059,6 +2059,15 @@ impl Shell {
         })
     }
 
+    pub fn resizing_element_for_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
+        self.mapped().find(|mapped| {
+            mapped.resize_state.lock().unwrap().is_some()
+                && mapped
+                    .windows()
+                    .any(|(window, _)| window.wl_surface().as_deref() == Some(surface))
+        })
+    }
+
     pub fn is_surface_mapped<S>(&self, surface: &S) -> bool
     where
         CosmicSurface: PartialEq<S>,
