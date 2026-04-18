@@ -2,7 +2,7 @@
 
 use crate::{
     config::{CompOutputConfig, ScreenFilter},
-    shell::Shell,
+    shell::{SeatExt, Shell},
     state::BackendData,
     utils::{env::dev_var, prelude::*},
 };
@@ -59,6 +59,37 @@ pub(crate) use surface::Surface;
 pub use surface::Timings;
 
 use super::render::{CLEAR_COLOR, CursorMode, output_elements};
+
+fn collect_input_redraw_outputs(shell: &Shell) -> Vec<Output> {
+    let mut outputs = Vec::new();
+
+    let mut push_unique = |output: Output| {
+        if !outputs.iter().any(|existing| *existing == output) {
+            outputs.push(output);
+        }
+    };
+
+    for seat in shell.seats.iter() {
+        push_unique(seat.active_output());
+
+        if let Some(output) = seat.focused_output() {
+            push_unique(output);
+        }
+
+        if let Some(pointer) = seat.get_pointer() {
+            let pointer_location = pointer.current_location().as_global();
+            if let Some(output) = shell
+                .outputs()
+                .find(|output| output.geometry().to_f64().contains(pointer_location))
+                .cloned()
+            {
+                push_unique(output);
+            }
+        }
+    }
+
+    outputs
+}
 
 #[derive(Debug)]
 pub struct KmsState {
@@ -203,10 +234,26 @@ fn init_libinput(
             state.backend.kms().input_devices.remove(device.name());
         }
 
+        let mut outputs = {
+            let shell = state.common.shell.read();
+            collect_input_redraw_outputs(&shell)
+        };
+
         state.process_input_event(event);
 
-        for output in state.common.shell.read().outputs() {
-            state.backend.kms().schedule_render(output);
+        let additional_outputs = {
+            let shell = state.common.shell.read();
+            collect_input_redraw_outputs(&shell)
+        };
+
+        for output in additional_outputs {
+            if !outputs.iter().any(|existing| *existing == output) {
+                outputs.push(output);
+            }
+        }
+
+        for output in outputs {
+            state.backend.kms().schedule_render(&output);
         }
     })
     .map_err(|err| err.error)
