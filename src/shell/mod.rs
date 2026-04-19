@@ -46,7 +46,7 @@ use smithay::{
     output::{Output, WeakOutput},
     reexports::{
         wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
-        wayland_server::{Client, protocol::wl_surface::WlSurface},
+        wayland_server::{Client, Resource, backend::ObjectId, protocol::wl_surface::WlSurface},
     },
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
     wayland::{
@@ -124,6 +124,89 @@ struct SurfaceCommitLookupCache {
     element: Mutex<Option<CosmicMappedKey>>,
 }
 
+#[derive(Clone)]
+enum SurfaceIndexRole {
+    Sticky {
+        output: WeakOutput,
+        key: CosmicMappedKey,
+    },
+    SetMinimized {
+        output: WeakOutput,
+        key: CosmicMappedKey,
+    },
+    WorkspaceMapped {
+        workspace: WorkspaceHandle,
+        key: CosmicMappedKey,
+    },
+    WorkspaceMinimized {
+        workspace: WorkspaceHandle,
+        key: CosmicMappedKey,
+    },
+    WorkspaceFullscreen {
+        workspace: WorkspaceHandle,
+    },
+    Layer {
+        output: WeakOutput,
+    },
+    PendingLayer {
+        output: WeakOutput,
+    },
+    SessionLock {
+        output: WeakOutput,
+    },
+}
+
+#[derive(Clone)]
+struct SurfaceIndexEntry {
+    role: SurfaceIndexRole,
+}
+
+impl std::fmt::Debug for SurfaceIndexRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SurfaceIndexRole::Sticky { output, .. } => f
+                .debug_struct("Sticky")
+                .field("output", output)
+                .finish_non_exhaustive(),
+            SurfaceIndexRole::SetMinimized { output, .. } => f
+                .debug_struct("SetMinimized")
+                .field("output", output)
+                .finish_non_exhaustive(),
+            SurfaceIndexRole::WorkspaceMapped { workspace, .. } => f
+                .debug_struct("WorkspaceMapped")
+                .field("workspace", workspace)
+                .finish_non_exhaustive(),
+            SurfaceIndexRole::WorkspaceMinimized { workspace, .. } => f
+                .debug_struct("WorkspaceMinimized")
+                .field("workspace", workspace)
+                .finish_non_exhaustive(),
+            SurfaceIndexRole::WorkspaceFullscreen { workspace } => f
+                .debug_struct("WorkspaceFullscreen")
+                .field("workspace", workspace)
+                .finish(),
+            SurfaceIndexRole::Layer { output } => {
+                f.debug_struct("Layer").field("output", output).finish()
+            }
+            SurfaceIndexRole::PendingLayer { output } => f
+                .debug_struct("PendingLayer")
+                .field("output", output)
+                .finish(),
+            SurfaceIndexRole::SessionLock { output } => f
+                .debug_struct("SessionLock")
+                .field("output", output)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SurfaceIndexEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SurfaceIndexEntry")
+            .field("role", &self.role)
+            .finish()
+    }
+}
+
 #[derive(Debug, Default)]
 struct SurfaceLookupCounters {
     output_hint_hits: u64,
@@ -134,6 +217,12 @@ struct SurfaceLookupCounters {
     element_hint_misses: u64,
     element_hint_stale: u64,
     element_hint_fallbacks: u64,
+    output_index_hits: u64,
+    output_index_misses: u64,
+    output_index_stale: u64,
+    element_index_hits: u64,
+    element_index_misses: u64,
+    element_index_stale: u64,
 }
 
 #[derive(Debug)]
@@ -316,6 +405,7 @@ pub struct Shell {
     pub seats: Seats,
     pub previous_workspace_idx: Option<(Serial, WeakOutput, usize)>,
     pub xwayland_keyboard_grab: Option<XWaylandKeyboardGrab<State>>,
+    surface_index: Mutex<HashMap<ObjectId, SurfaceIndexEntry>>,
     surface_lookup_stats: Mutex<SurfaceLookupStats>,
 
     theme: cosmic::Theme,
@@ -1636,6 +1726,7 @@ impl Shell {
             session_lock: None,
             previous_workspace_idx: None,
             xwayland_keyboard_grab: None,
+            surface_index: Mutex::new(HashMap::new()),
             surface_lookup_stats: Mutex::new(SurfaceLookupStats::default()),
 
             theme,
@@ -1968,20 +2059,324 @@ impl Shell {
                 output_hint_hits = counters.output_hint_hits,
                 output_hint_misses = counters.output_hint_misses,
                 output_hint_stale = counters.output_hint_stale,
-                output_hint_fallbacks = counters.output_hint_fallbacks,
-                element_hint_hits = counters.element_hint_hits,
-                element_hint_misses = counters.element_hint_misses,
-                element_hint_stale = counters.element_hint_stale,
-                element_hint_fallbacks = counters.element_hint_fallbacks,
-                "[perf] surface lookup cache stats"
-            );
-        }
+            output_hint_fallbacks = counters.output_hint_fallbacks,
+            element_hint_hits = counters.element_hint_hits,
+            element_hint_misses = counters.element_hint_misses,
+            element_hint_stale = counters.element_hint_stale,
+            element_hint_fallbacks = counters.element_hint_fallbacks,
+            output_index_hits = counters.output_index_hits,
+            output_index_misses = counters.output_index_misses,
+            output_index_stale = counters.output_index_stale,
+            element_index_hits = counters.element_index_hits,
+            element_index_misses = counters.element_index_misses,
+            element_index_stale = counters.element_index_stale,
+            "[perf] surface lookup cache stats"
+        );
+    }
     }
 
     fn update_surface_lookup_element_cache(surface: &WlSurface, mapped: &CosmicMapped) {
         with_surface_commit_lookup_cache(surface, |cache| {
             *cache.element.lock().unwrap() = Some(mapped.key());
         });
+    }
+
+    fn surface_index_entry(&self, surface: &WlSurface) -> Option<SurfaceIndexEntry> {
+        self.surface_index
+            .lock()
+            .unwrap()
+            .get(&surface.id())
+            .cloned()
+    }
+
+    fn clear_surface_index_entry(&self, surface: &WlSurface) {
+        self.surface_index.lock().unwrap().remove(&surface.id());
+    }
+
+    fn output_from_weak<'a>(&'a self, output: &WeakOutput) -> Option<&'a Output> {
+        let output = output.upgrade()?;
+        self.outputs().find(|candidate| **candidate == output)
+    }
+
+    fn ensure_surface_index_populated(&self) {
+        if self.surface_index.lock().unwrap().is_empty() {
+            self.rebuild_surface_index();
+        }
+    }
+
+    fn insert_surface_index_tree(
+        index: &mut HashMap<ObjectId, SurfaceIndexEntry>,
+        root: &WlSurface,
+        entry: &SurfaceIndexEntry,
+    ) {
+        smithay::wayland::compositor::with_surface_tree_downward(
+            root,
+            (),
+            |_, _, _| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+            |surface, _, _| {
+                index.insert(surface.id(), entry.clone());
+            },
+            |_, _, _| true,
+        );
+    }
+
+    fn insert_mapped_surface_index(
+        index: &mut HashMap<ObjectId, SurfaceIndexEntry>,
+        mapped: &CosmicMapped,
+        role: SurfaceIndexRole,
+    ) {
+        let entry = SurfaceIndexEntry { role };
+        for (window, _) in mapped.windows() {
+            window.with_surfaces(|surface, _| {
+                index.insert(surface.id(), entry.clone());
+            });
+        }
+    }
+
+    pub fn rebuild_surface_index(&self) {
+        let mut index = self.surface_index.lock().unwrap();
+        index.clear();
+
+        if let Some(session_lock) = self.session_lock.as_ref() {
+            for (output, lock_surface) in &session_lock.surfaces {
+                let entry = SurfaceIndexEntry {
+                    role: SurfaceIndexRole::SessionLock {
+                        output: output.downgrade(),
+                    },
+                };
+                Self::insert_surface_index_tree(&mut index, lock_surface.wl_surface(), &entry);
+            }
+        }
+
+        for pending in &self.pending_layers {
+            let entry = SurfaceIndexEntry {
+                role: SurfaceIndexRole::PendingLayer {
+                    output: pending.output.downgrade(),
+                },
+            };
+            pending.surface.with_surfaces(|surface, _| {
+                index.insert(surface.id(), entry.clone());
+            });
+        }
+
+        for output in self.outputs() {
+            let entry = SurfaceIndexEntry {
+                role: SurfaceIndexRole::Layer {
+                    output: output.downgrade(),
+                },
+            };
+            let map = layer_map_for_output(output);
+            for layer_surface in map.layers() {
+                layer_surface.with_surfaces(|surface, _| {
+                    index.insert(surface.id(), entry.clone());
+                });
+            }
+        }
+
+        for (output, set) in self.workspaces.iter() {
+            for mapped in set.sticky_layer.mapped() {
+                Self::insert_mapped_surface_index(
+                    &mut index,
+                    mapped,
+                    SurfaceIndexRole::Sticky {
+                        output: output.downgrade(),
+                        key: mapped.key(),
+                    },
+                );
+            }
+
+            for minimized in &set.minimized_windows {
+                if let Some(mapped) = minimized.mapped() {
+                    Self::insert_mapped_surface_index(
+                        &mut index,
+                        mapped,
+                        SurfaceIndexRole::SetMinimized {
+                            output: output.downgrade(),
+                            key: mapped.key(),
+                        },
+                    );
+                }
+            }
+
+            for workspace in &set.workspaces {
+                if let Some(fullscreen) = workspace.get_fullscreen() {
+                    let entry = SurfaceIndexEntry {
+                        role: SurfaceIndexRole::WorkspaceFullscreen {
+                            workspace: workspace.handle,
+                        },
+                    };
+                    fullscreen.with_surfaces(|surface, _| {
+                        index.insert(surface.id(), entry.clone());
+                    });
+                }
+
+                for mapped in workspace.mapped() {
+                    Self::insert_mapped_surface_index(
+                        &mut index,
+                        mapped,
+                        SurfaceIndexRole::WorkspaceMapped {
+                            workspace: workspace.handle,
+                            key: mapped.key(),
+                        },
+                    );
+                }
+
+                for minimized in &workspace.minimized_windows {
+                    if let Some(mapped) = minimized.mapped() {
+                        Self::insert_mapped_surface_index(
+                            &mut index,
+                            mapped,
+                            SurfaceIndexRole::WorkspaceMinimized {
+                                workspace: workspace.handle,
+                                key: mapped.key(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn mapped_for_index_role<'a>(
+        &'a self,
+        role: &SurfaceIndexRole,
+        surface: &WlSurface,
+    ) -> Option<&'a CosmicMapped> {
+        match role {
+            SurfaceIndexRole::Sticky { output, key } => {
+                let output = self.output_from_weak(output)?;
+                let set = self.workspaces.sets.get(output)?;
+                set.sticky_layer
+                    .mapped()
+                    .find(|mapped| {
+                        mapped.key() == *key && mapped.has_surface(surface, WindowSurfaceType::ALL)
+                    })
+            }
+            SurfaceIndexRole::SetMinimized { output, key } => {
+                let output = self.output_from_weak(output)?;
+                let set = self.workspaces.sets.get(output)?;
+                set.minimized_windows.iter().find_map(|window| {
+                    let mapped = window.mapped()?;
+                    (mapped.key() == *key && mapped.has_surface(surface, WindowSurfaceType::ALL))
+                        .then_some(mapped)
+                })
+            }
+            SurfaceIndexRole::WorkspaceMapped { workspace, key } => {
+                let workspace = self.workspaces.space_for_handle(workspace)?;
+                workspace.mapped().find(|mapped| {
+                    mapped.key() == *key && mapped.has_surface(surface, WindowSurfaceType::ALL)
+                })
+            }
+            SurfaceIndexRole::WorkspaceMinimized { workspace, key } => {
+                let workspace = self.workspaces.space_for_handle(workspace)?;
+                workspace.minimized_windows.iter().find_map(|window| {
+                    let mapped = window.mapped()?;
+                    (mapped.key() == *key && mapped.has_surface(surface, WindowSurfaceType::ALL))
+                        .then_some(mapped)
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn indexed_element_for_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
+        self.ensure_surface_index_populated();
+        let Some(entry) = self.surface_index_entry(surface) else {
+            self.note_surface_lookup_stats(|stats| stats.element_index_misses += 1);
+            return None;
+        };
+
+        if let Some(mapped) = self.mapped_for_index_role(&entry.role, surface) {
+            Self::update_surface_lookup_element_cache(surface, mapped);
+            self.note_surface_lookup_stats(|stats| stats.element_index_hits += 1);
+            return Some(mapped);
+        }
+
+        self.clear_surface_index_entry(surface);
+        self.note_surface_lookup_stats(|stats| stats.element_index_stale += 1);
+        None
+    }
+
+    fn indexed_output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
+        self.ensure_surface_index_populated();
+        let Some(entry) = self.surface_index_entry(surface) else {
+            self.note_surface_lookup_stats(|stats| stats.output_index_misses += 1);
+            return None;
+        };
+
+        let output = match &entry.role {
+            SurfaceIndexRole::Sticky { output, .. } => {
+                let output = self.output_from_weak(output)?;
+                self.mapped_for_index_role(&entry.role, surface)?;
+                Some(output)
+            }
+            SurfaceIndexRole::WorkspaceMapped { workspace, .. } => {
+                let workspace = self.workspaces.space_for_handle(workspace)?;
+                self.mapped_for_index_role(&entry.role, surface)?;
+                Some(workspace.output())
+            }
+            SurfaceIndexRole::WorkspaceFullscreen { workspace } => {
+                let workspace = self.workspaces.space_for_handle(workspace)?;
+                workspace
+                    .get_fullscreen()
+                    .filter(|window| window.has_surface(surface, WindowSurfaceType::ALL))
+                    .map(|_| workspace.output())
+            }
+            SurfaceIndexRole::Layer { output } => {
+                let output = self.output_from_weak(output)?;
+                layer_map_for_output(output)
+                    .layer_for_surface(surface, WindowSurfaceType::ALL)
+                    .map(|_| output)
+            }
+            SurfaceIndexRole::PendingLayer { output } => {
+                let output = self.output_from_weak(output)?;
+                self.pending_layers
+                    .iter()
+                    .filter(|pending| pending.output == *output)
+                    .any(|pending| {
+                        let mut found = false;
+                        pending.surface.with_surfaces(|candidate, _| {
+                            found |= candidate == surface;
+                        });
+                        found
+                    })
+                    .then_some(output)
+            }
+            SurfaceIndexRole::SessionLock { output } => {
+                let output = self.output_from_weak(output)?;
+                self.session_lock
+                    .as_ref()
+                    .and_then(|session_lock| session_lock.surfaces.get(output))
+                    .and_then(|lock_surface| {
+                        let found = std::sync::atomic::AtomicBool::new(false);
+                        smithay::wayland::compositor::with_surface_tree_downward(
+                            lock_surface.wl_surface(),
+                            (),
+                            |_, _, _| {
+                                smithay::wayland::compositor::TraversalAction::DoChildren(())
+                            },
+                            |candidate, _, _| {
+                                found.fetch_or(candidate == surface, Ordering::SeqCst);
+                            },
+                            |_, _, _| !found.load(Ordering::SeqCst),
+                        );
+                        found.load(Ordering::SeqCst).then_some(output)
+                    })
+            }
+            SurfaceIndexRole::SetMinimized { .. } | SurfaceIndexRole::WorkspaceMinimized { .. } => {
+                None
+            }
+        };
+
+        if let Some(output) = output {
+            Self::update_surface_lookup_output_cache(surface, output);
+            self.note_surface_lookup_stats(|stats| stats.output_index_hits += 1);
+            return Some(output);
+        }
+
+        self.clear_surface_index_entry(surface);
+        self.note_surface_lookup_stats(|stats| stats.output_index_stale += 1);
+        None
     }
 
     fn cached_output_hint_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
@@ -2205,6 +2600,10 @@ impl Shell {
             return output;
         }
 
+        if let Some(output) = self.indexed_output_for_surface(surface) {
+            return Some(output);
+        }
+
         if let Some(output) = self.cached_output_hint_for_surface(surface) {
             return Some(output);
         }
@@ -2229,6 +2628,10 @@ impl Shell {
     }
 
     pub fn cached_element_for_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
+        if let Some(mapped) = self.indexed_element_for_surface(surface) {
+            return Some(mapped);
+        }
+
         if let Some(mapped) = self.cached_element_hint_for_surface(surface) {
             return Some(mapped);
         }
@@ -2299,6 +2702,12 @@ impl Shell {
     }
 
     pub fn resizing_element_for_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
+        if let Some(mapped) = self.indexed_element_for_surface(surface)
+            && mapped.resize_state.lock().unwrap().is_some()
+        {
+            return Some(mapped);
+        }
+
         if let Some(mapped) = self.cached_element_hint_for_surface(surface)
             && mapped.resize_state.lock().unwrap().is_some()
         {
