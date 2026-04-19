@@ -269,27 +269,34 @@ impl CompositorHandler for State {
         let mapped = self.send_initial_configure_and_map(surface);
 
         let mut shell = self.common.shell.write();
+        shell.note_commit_total();
 
         let layer_output = shell.layer_output_for_surface(surface).cloned();
+        let visible_output = if layer_output.is_none() {
+            shell.visible_output_for_surface(surface).cloned()
+        } else {
+            None
+        };
 
         // schedule a new render
-        if let Some(output) = layer_output
-            .as_ref()
-            .or_else(|| shell.visible_output_for_surface(surface))
-        {
+        if let Some(output) = layer_output.as_ref().or(visible_output.as_ref()) {
             self.backend.schedule_render(output);
         }
+        shell.note_commit_schedule_source(layer_output.is_some(), visible_output.is_some());
 
         if mapped {
+            shell.note_commit_mapped_short_circuit();
             return;
         }
 
         if let Some(popup) = self.common.popups.find_popup(surface) {
+            shell.note_commit_popup_short_circuit();
             xdg_popup_ensure_initial_configure(&popup);
             return;
         }
 
         if with_renderer_surface_state(surface, |state| state.buffer().is_none()).unwrap_or(false) {
+            shell.note_commit_null_buffer();
             // handle null-commits causing weird conflicts:
 
             // session-lock disallows null commits
@@ -349,15 +356,19 @@ impl CompositorHandler for State {
             // We only want to resize once the client has acknoledged & commited the new size,
             // so we need to carefully track the state through different handlers.
             if let Some(element) = shell.resizing_element_for_surface(surface).cloned() {
+                shell.note_commit_resize_lookup(true);
                 crate::shell::layout::floating::ResizeSurfaceGrab::apply_resize_to_location(
                     element,
                     &mut shell,
                 );
+            } else {
+                shell.note_commit_resize_lookup(false);
             }
         }
 
         if let Some(output) = layer_output {
             let changed = layer_map_for_output(&output).arrange();
+            shell.note_commit_layer_arrange(changed);
             if changed {
                 shell.workspaces.recalculate();
             }

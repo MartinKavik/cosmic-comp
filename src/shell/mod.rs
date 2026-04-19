@@ -59,7 +59,7 @@ use smithay::{
     },
     xwayland::X11Surface,
 };
-use tracing::{error, info};
+use tracing::{error, warn};
 
 use crate::{
     backend::render::animations::spring::{Spring, SpringParams},
@@ -235,6 +235,24 @@ impl std::fmt::Debug for SurfaceIndexEntry {
 
 #[derive(Debug, Default)]
 struct SurfaceLookupCounters {
+    commit_total: u64,
+    commit_mapped_short_circuit: u64,
+    commit_popup_short_circuit: u64,
+    commit_null_buffer: u64,
+    commit_resize_lookup_hits: u64,
+    commit_resize_lookup_misses: u64,
+    commit_schedule_from_layer: u64,
+    commit_schedule_from_visible: u64,
+    commit_schedule_misses: u64,
+    commit_layer_arrange_changed: u64,
+    commit_layer_arrange_unchanged: u64,
+    visible_path_primary_scanout: u64,
+    visible_path_session_lock: u64,
+    visible_path_index: u64,
+    visible_path_output_hint: u64,
+    visible_path_element_hint: u64,
+    visible_path_full_scan: u64,
+    visible_path_miss: u64,
     output_hint_hits: u64,
     output_hint_misses: u64,
     output_hint_stale: u64,
@@ -249,6 +267,13 @@ struct SurfaceLookupCounters {
     element_index_hits: u64,
     element_index_misses: u64,
     element_index_stale: u64,
+    workspace_index_hits: u64,
+    workspace_index_misses: u64,
+    workspace_index_stale: u64,
+    index_rebuilds: u64,
+    index_rebuild_entries_total: u64,
+    index_rebuild_us_total: u64,
+    index_rebuild_us_max: u64,
 }
 
 #[derive(Debug)]
@@ -2081,24 +2106,110 @@ impl Shell {
             stats.last_log = Instant::now();
             std::mem::drop(stats);
 
-            info!(
+            warn!(
+                commit_total = counters.commit_total,
+                commit_mapped_short_circuit = counters.commit_mapped_short_circuit,
+                commit_popup_short_circuit = counters.commit_popup_short_circuit,
+                commit_null_buffer = counters.commit_null_buffer,
+                commit_resize_lookup_hits = counters.commit_resize_lookup_hits,
+                commit_resize_lookup_misses = counters.commit_resize_lookup_misses,
+                commit_schedule_from_layer = counters.commit_schedule_from_layer,
+                commit_schedule_from_visible = counters.commit_schedule_from_visible,
+                commit_schedule_misses = counters.commit_schedule_misses,
+                commit_layer_arrange_changed = counters.commit_layer_arrange_changed,
+                commit_layer_arrange_unchanged = counters.commit_layer_arrange_unchanged,
+                visible_path_primary_scanout = counters.visible_path_primary_scanout,
+                visible_path_session_lock = counters.visible_path_session_lock,
+                visible_path_index = counters.visible_path_index,
+                visible_path_output_hint = counters.visible_path_output_hint,
+                visible_path_element_hint = counters.visible_path_element_hint,
+                visible_path_full_scan = counters.visible_path_full_scan,
+                visible_path_miss = counters.visible_path_miss,
                 output_hint_hits = counters.output_hint_hits,
                 output_hint_misses = counters.output_hint_misses,
                 output_hint_stale = counters.output_hint_stale,
-            output_hint_fallbacks = counters.output_hint_fallbacks,
-            element_hint_hits = counters.element_hint_hits,
-            element_hint_misses = counters.element_hint_misses,
-            element_hint_stale = counters.element_hint_stale,
-            element_hint_fallbacks = counters.element_hint_fallbacks,
-            output_index_hits = counters.output_index_hits,
-            output_index_misses = counters.output_index_misses,
-            output_index_stale = counters.output_index_stale,
-            element_index_hits = counters.element_index_hits,
-            element_index_misses = counters.element_index_misses,
-            element_index_stale = counters.element_index_stale,
-            "[perf] surface lookup cache stats"
-        );
+                output_hint_fallbacks = counters.output_hint_fallbacks,
+                element_hint_hits = counters.element_hint_hits,
+                element_hint_misses = counters.element_hint_misses,
+                element_hint_stale = counters.element_hint_stale,
+                element_hint_fallbacks = counters.element_hint_fallbacks,
+                output_index_hits = counters.output_index_hits,
+                output_index_misses = counters.output_index_misses,
+                output_index_stale = counters.output_index_stale,
+                element_index_hits = counters.element_index_hits,
+                element_index_misses = counters.element_index_misses,
+                element_index_stale = counters.element_index_stale,
+                workspace_index_hits = counters.workspace_index_hits,
+                workspace_index_misses = counters.workspace_index_misses,
+                workspace_index_stale = counters.workspace_index_stale,
+                index_rebuilds = counters.index_rebuilds,
+                index_rebuild_entries_total = counters.index_rebuild_entries_total,
+                index_rebuild_us_total = counters.index_rebuild_us_total,
+                index_rebuild_us_max = counters.index_rebuild_us_max,
+                "[perf] surface lookup cache stats"
+            );
+        }
     }
+
+    pub fn note_commit_total(&self) {
+        self.note_surface_lookup_stats(|stats| stats.commit_total += 1);
+    }
+
+    pub fn note_commit_mapped_short_circuit(&self) {
+        self.note_surface_lookup_stats(|stats| stats.commit_mapped_short_circuit += 1);
+    }
+
+    pub fn note_commit_popup_short_circuit(&self) {
+        self.note_surface_lookup_stats(|stats| stats.commit_popup_short_circuit += 1);
+    }
+
+    pub fn note_commit_null_buffer(&self) {
+        self.note_surface_lookup_stats(|stats| stats.commit_null_buffer += 1);
+    }
+
+    pub fn note_commit_resize_lookup(&self, hit: bool) {
+        self.note_surface_lookup_stats(|stats| {
+            if hit {
+                stats.commit_resize_lookup_hits += 1;
+            } else {
+                stats.commit_resize_lookup_misses += 1;
+            }
+        });
+    }
+
+    pub fn note_commit_schedule_source(&self, layer_hit: bool, visible_hit: bool) {
+        self.note_surface_lookup_stats(|stats| {
+            if layer_hit {
+                stats.commit_schedule_from_layer += 1;
+            } else if visible_hit {
+                stats.commit_schedule_from_visible += 1;
+            } else {
+                stats.commit_schedule_misses += 1;
+            }
+        });
+    }
+
+    pub fn note_commit_layer_arrange(&self, changed: bool) {
+        self.note_surface_lookup_stats(|stats| {
+            if changed {
+                stats.commit_layer_arrange_changed += 1;
+            } else {
+                stats.commit_layer_arrange_unchanged += 1;
+            }
+        });
+    }
+
+    fn note_visible_output_path(&self, path: &'static str) {
+        self.note_surface_lookup_stats(|stats| match path {
+            "primary_scanout" => stats.visible_path_primary_scanout += 1,
+            "session_lock" => stats.visible_path_session_lock += 1,
+            "index" => stats.visible_path_index += 1,
+            "output_hint" => stats.visible_path_output_hint += 1,
+            "element_hint" => stats.visible_path_element_hint += 1,
+            "full_scan" => stats.visible_path_full_scan += 1,
+            "miss" => stats.visible_path_miss += 1,
+            _ => {}
+        });
     }
 
     fn update_surface_lookup_element_cache(surface: &WlSurface, mapped: &CosmicMapped) {
@@ -2160,6 +2271,7 @@ impl Shell {
     }
 
     pub fn rebuild_surface_index(&self) {
+        let start = Instant::now();
         let mut index = self.surface_index.lock().unwrap();
         index.clear();
 
@@ -2318,6 +2430,16 @@ impl Shell {
                 Self::insert_surface_index_tree(&mut index, &surface, &entry);
             }
         }
+
+        let entries = index.len() as u64;
+        let elapsed = start.elapsed().as_micros() as u64;
+        std::mem::drop(index);
+        self.note_surface_lookup_stats(|stats| {
+            stats.index_rebuilds += 1;
+            stats.index_rebuild_entries_total += entries;
+            stats.index_rebuild_us_total += elapsed;
+            stats.index_rebuild_us_max = stats.index_rebuild_us_max.max(elapsed);
+        });
     }
 
     fn mapped_for_index_role<'a>(
@@ -2528,9 +2650,12 @@ impl Shell {
 
     fn indexed_workspace_for_surface(&self, surface: &WlSurface) -> Option<(WorkspaceHandle, Output)> {
         self.ensure_surface_index_populated();
-        let entry = self.surface_index_entry(surface)?;
+        let Some(entry) = self.surface_index_entry(surface) else {
+            self.note_surface_lookup_stats(|stats| stats.workspace_index_misses += 1);
+            return None;
+        };
 
-        match &entry.role {
+        let workspace = match &entry.role {
             SurfaceIndexRole::Layer { output } | SurfaceIndexRole::PendingLayer { output } => {
                 let output = self.output_from_weak(output)?;
                 self.workspaces
@@ -2569,7 +2694,16 @@ impl Shell {
             | SurfaceIndexRole::MoveGrab { .. }
             | SurfaceIndexRole::DndIcon { .. }
             | SurfaceIndexRole::OverrideRedirect { .. } => None,
+        };
+
+        if workspace.is_some() {
+            self.note_surface_lookup_stats(|stats| stats.workspace_index_hits += 1);
+        } else {
+            self.clear_surface_index_entry(surface);
+            self.note_surface_lookup_stats(|stats| stats.workspace_index_stale += 1);
         }
+
+        workspace
     }
 
     fn cached_output_hint_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
@@ -2777,6 +2911,7 @@ impl Shell {
         }) {
             if let Some(output) = self.outputs().find(|output| **output == primary_output) {
                 Self::update_surface_lookup_output_cache(surface, output);
+                self.note_visible_output_path("primary_scanout");
                 return Some(output);
             }
         }
@@ -2789,15 +2924,18 @@ impl Shell {
                 .map(|(k, _)| k);
             if let Some(output) = output {
                 Self::update_surface_lookup_output_cache(surface, output);
+                self.note_visible_output_path("session_lock");
             }
             return output;
         }
 
         if let Some(output) = self.indexed_output_for_surface(surface) {
+            self.note_visible_output_path("index");
             return Some(output);
         }
 
         if let Some(output) = self.cached_output_hint_for_surface(surface) {
+            self.note_visible_output_path("output_hint");
             return Some(output);
         }
 
@@ -2805,6 +2943,7 @@ impl Shell {
             && let Some(output) = self.output_for_mapped(mapped)
         {
             Self::update_surface_lookup_output_cache(surface, output);
+            self.note_visible_output_path("element_hint");
             return Some(output);
         }
 
@@ -2814,6 +2953,9 @@ impl Shell {
 
         if let Some(output) = output {
             Self::update_surface_lookup_output_cache(surface, output);
+            self.note_visible_output_path("full_scan");
+        } else {
+            self.note_visible_output_path("miss");
         }
         self.note_surface_lookup_stats(|stats| stats.output_hint_fallbacks += 1);
 
