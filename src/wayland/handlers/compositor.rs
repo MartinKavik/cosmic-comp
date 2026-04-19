@@ -8,7 +8,7 @@ use smithay::{
         utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
     delegate_compositor,
-    desktop::{LayerSurface, PopupKind, WindowSurfaceType, layer_map_for_output},
+    desktop::{LayerSurface, PopupKind, layer_map_for_output},
     reexports::wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     utils::{Clock, Logical, Monotonic, SERIAL_COUNTER, Size, Time},
     wayland::{
@@ -270,8 +270,13 @@ impl CompositorHandler for State {
 
         let mut shell = self.common.shell.write();
 
+        let layer_output = shell.layer_output_for_surface(surface).cloned();
+
         // schedule a new render
-        if let Some(output) = shell.visible_output_for_surface(surface) {
+        if let Some(output) = layer_output
+            .as_ref()
+            .or_else(|| shell.visible_output_for_surface(surface))
+        {
             self.backend.schedule_render(output);
         }
 
@@ -350,16 +355,6 @@ impl CompositorHandler for State {
                 );
             }
         }
-
-        // re-arrange layer-surfaces (commits may change size and positioning)
-        let layer_output = shell
-            .outputs()
-            .find(|o| {
-                let map = layer_map_for_output(o);
-                map.layer_for_surface(surface, WindowSurfaceType::ALL)
-                    .is_some()
-            })
-            .cloned();
 
         if let Some(output) = layer_output {
             let changed = layer_map_for_output(&output).arrange();

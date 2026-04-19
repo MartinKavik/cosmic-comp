@@ -1991,6 +1991,35 @@ impl Shell {
         self.space_for(mapped).map(|workspace| workspace.output())
     }
 
+    pub fn layer_output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
+        let output = self.outputs().find(|output| {
+            let map = layer_map_for_output(output);
+            map.layer_for_surface(surface, WindowSurfaceType::ALL)
+                .is_some()
+        });
+
+        if let Some(output) = output {
+            Self::update_surface_lookup_output_cache(surface, output);
+            return Some(output);
+        }
+
+        let output = self.pending_layers.iter().find_map(|pending| {
+            let mut found = false;
+            pending.surface.with_surfaces(|s, _| {
+                if s == surface {
+                    found = true;
+                }
+            });
+            found.then_some(&pending.output)
+        });
+
+        if let Some(output) = output {
+            Self::update_surface_lookup_output_cache(surface, output);
+        }
+
+        output
+    }
+
     fn surface_visible_on_output(&self, surface: &WlSurface, output: &Output) -> bool {
         let map = layer_map_for_output(output);
         if map
