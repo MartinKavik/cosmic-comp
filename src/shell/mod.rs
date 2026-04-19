@@ -1978,6 +1978,19 @@ impl Shell {
         Some(mapped)
     }
 
+    fn output_for_mapped(&self, mapped: &CosmicMapped) -> Option<&Output> {
+        if let Some((output, _)) = self
+            .workspaces
+            .sets
+            .iter()
+            .find(|(_, set)| set.sticky_layer.mapped().any(|candidate| candidate == mapped))
+        {
+            return Some(output);
+        }
+
+        self.space_for(mapped).map(|workspace| workspace.output())
+    }
+
     fn surface_visible_on_output(&self, surface: &WlSurface, output: &Output) -> bool {
         let map = layer_map_for_output(output);
         if map
@@ -2100,6 +2113,13 @@ impl Shell {
         }
 
         if let Some(output) = self.cached_output_hint_for_surface(surface) {
+            return Some(output);
+        }
+
+        if let Some(mapped) = self.cached_element_hint_for_surface(surface)
+            && let Some(output) = self.output_for_mapped(mapped)
+        {
+            Self::update_surface_lookup_output_cache(surface, output);
             return Some(output);
         }
 
