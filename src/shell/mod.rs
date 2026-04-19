@@ -1963,8 +1963,11 @@ impl Shell {
         });
 
         let Some(mapped) = cached.and_then(|key| {
-            self.mapped()
-                .find(|mapped| mapped.key() == key && mapped.has_toplevel_surface(surface))
+            self.mapped().find(|mapped| {
+                mapped.key() == key
+                    && (mapped.has_toplevel_surface(surface)
+                        || mapped.has_surface(surface, WindowSurfaceType::ALL))
+            })
         }) else {
             with_surface_commit_lookup_cache(surface, |cache| {
                 *cache.element.lock().unwrap() = None;
