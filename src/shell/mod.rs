@@ -154,6 +154,18 @@ enum SurfaceIndexRole {
     SessionLock {
         output: WeakOutput,
     },
+    Cursor {
+        output: WeakOutput,
+    },
+    MoveGrab {
+        output: WeakOutput,
+    },
+    DndIcon {
+        output: WeakOutput,
+    },
+    OverrideRedirect {
+        output: WeakOutput,
+    },
 }
 
 #[derive(Clone)]
@@ -193,6 +205,20 @@ impl std::fmt::Debug for SurfaceIndexRole {
                 .finish(),
             SurfaceIndexRole::SessionLock { output } => f
                 .debug_struct("SessionLock")
+                .field("output", output)
+                .finish(),
+            SurfaceIndexRole::Cursor { output } => {
+                f.debug_struct("Cursor").field("output", output).finish()
+            }
+            SurfaceIndexRole::MoveGrab { output } => f
+                .debug_struct("MoveGrab")
+                .field("output", output)
+                .finish(),
+            SurfaceIndexRole::DndIcon { output } => {
+                f.debug_struct("DndIcon").field("output", output).finish()
+            }
+            SurfaceIndexRole::OverrideRedirect { output } => f
+                .debug_struct("OverrideRedirect")
                 .field("output", output)
                 .finish(),
         }
@@ -2148,6 +2174,43 @@ impl Shell {
             }
         }
 
+        for seat in self.seats.iter() {
+            let output = seat.active_output().downgrade();
+
+            if let CursorImageStatus::Surface(surface) = seat.cursor_image_status() {
+                let entry = SurfaceIndexEntry {
+                    role: SurfaceIndexRole::Cursor {
+                        output: output.clone(),
+                    },
+                };
+                Self::insert_surface_index_tree(&mut index, &surface, &entry);
+            }
+
+            if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
+                && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
+            {
+                let entry = SurfaceIndexEntry {
+                    role: SurfaceIndexRole::MoveGrab {
+                        output: output.clone(),
+                    },
+                };
+                for (window, _) in grab_state.element().windows() {
+                    window.with_surfaces(|surface, _| {
+                        index.insert(surface.id(), entry.clone());
+                    });
+                }
+            }
+
+            if let Some(icon) = get_dnd_icon(seat) {
+                let entry = SurfaceIndexEntry {
+                    role: SurfaceIndexRole::DndIcon {
+                        output: output.clone(),
+                    },
+                };
+                Self::insert_surface_index_tree(&mut index, &icon.surface, &entry);
+            }
+        }
+
         for pending in &self.pending_layers {
             let entry = SurfaceIndexEntry {
                 role: SurfaceIndexRole::PendingLayer {
@@ -2233,6 +2296,26 @@ impl Shell {
                         );
                     }
                 }
+            }
+        }
+
+        for or in &self.override_redirect_windows {
+            let Some(surface) = or.wl_surface() else {
+                continue;
+            };
+
+            for output in self.outputs().filter(|output| {
+                or.geometry()
+                    .as_global()
+                    .intersection(output.geometry())
+                    .is_some()
+            }) {
+                let entry = SurfaceIndexEntry {
+                    role: SurfaceIndexRole::OverrideRedirect {
+                        output: output.downgrade(),
+                    },
+                };
+                Self::insert_surface_index_tree(&mut index, &surface, &entry);
             }
         }
     }
@@ -2362,6 +2445,70 @@ impl Shell {
                         );
                         found.load(Ordering::SeqCst).then_some(output)
                     })
+            }
+            SurfaceIndexRole::Cursor { output } => {
+                let output = self.output_from_weak(output)?;
+                self.seats
+                    .iter()
+                    .filter(|seat| seat.active_output() == *output)
+                    .find(|seat| {
+                        matches!(seat.cursor_image_status(), CursorImageStatus::Surface(ref cursor_surface) if cursor_surface == surface)
+                    })
+                    .map(|_| output)
+            }
+            SurfaceIndexRole::MoveGrab { output } => {
+                let output = self.output_from_weak(output)?;
+                self.seats
+                    .iter()
+                    .filter(|seat| seat.active_output() == *output)
+                    .find(|seat| {
+                        if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
+                            && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
+                        {
+                            grab_state.element().has_surface(surface, WindowSurfaceType::ALL)
+                        } else {
+                            false
+                        }
+                    })
+                    .map(|_| output)
+            }
+            SurfaceIndexRole::DndIcon { output } => {
+                let output = self.output_from_weak(output)?;
+                self.seats
+                    .iter()
+                    .filter(|seat| seat.active_output() == *output)
+                    .find(|seat| {
+                        get_dnd_icon(seat).is_some_and(|icon| {
+                            let found = std::sync::atomic::AtomicBool::new(false);
+                            smithay::wayland::compositor::with_surface_tree_downward(
+                                &icon.surface,
+                                (),
+                                |_, _, _| {
+                                    smithay::wayland::compositor::TraversalAction::DoChildren(())
+                                },
+                                |candidate, _, _| {
+                                    found.fetch_or(candidate == surface, Ordering::SeqCst);
+                                },
+                                |_, _, _| !found.load(Ordering::SeqCst),
+                            );
+                            found.load(Ordering::SeqCst)
+                        })
+                    })
+                    .map(|_| output)
+            }
+            SurfaceIndexRole::OverrideRedirect { output } => {
+                let output = self.output_from_weak(output)?;
+                self.override_redirect_windows
+                    .iter()
+                    .find(|or| {
+                        or.wl_surface().as_ref() == Some(surface)
+                            && or
+                                .geometry()
+                                .as_global()
+                                .intersection(output.geometry())
+                                .is_some()
+                    })
+                    .map(|_| output)
             }
             SurfaceIndexRole::SetMinimized { .. } | SurfaceIndexRole::WorkspaceMinimized { .. } => {
                 None
@@ -3439,6 +3586,7 @@ impl Shell {
                 workspace_state.add_workspace_state(&workspace_handle, WState::Urgent);
             }
 
+            self.rebuild_surface_index();
             return (workspace_output == seat.active_output() && active_handle == workspace_handle)
                 .then_some(KeyboardFocusTarget::Fullscreen(window));
         }
@@ -3452,6 +3600,7 @@ impl Shell {
             if was_activated {
                 workspace_state.add_workspace_state(&workspace_handle, WState::Urgent);
             }
+            self.rebuild_surface_index();
             return (workspace_output == seat.active_output() && active_handle == workspace_handle)
                 .then_some(KeyboardFocusTarget::Element(focused));
         }
@@ -3513,6 +3662,7 @@ impl Shell {
             self.update_reactive_popups(mapped);
         }
 
+        self.rebuild_surface_index();
         new_target
     }
 
@@ -3528,6 +3678,7 @@ impl Shell {
         }
 
         self.override_redirect_windows.push(window);
+        self.rebuild_surface_index();
     }
 
     #[must_use]
@@ -3555,6 +3706,7 @@ impl Shell {
             workspace.tiling_layer.recalculate();
         }
 
+        self.rebuild_surface_index();
         wants_focus.then(|| pending.surface.into())
     }
 
@@ -3622,6 +3774,7 @@ impl Shell {
 
             if let Some(surface) = surface {
                 toplevel_info.remove_toplevel(&surface);
+                self.rebuild_surface_index();
                 return Some(PendingWindow {
                     surface,
                     seat: seat.clone(),
@@ -3884,6 +4037,7 @@ impl Shell {
                 } // MinimizedWindow always has restore data
             };
             to_workspace.minimized_windows.push(minimized_window);
+            self.rebuild_surface_index();
             return None;
         }
 
@@ -3979,6 +4133,7 @@ impl Shell {
             self.update_reactive_popups(&mapped);
         }
 
+        self.rebuild_surface_index();
         new_pos.map(|pos| (focus_target, pos))
     }
 
@@ -4089,6 +4244,7 @@ impl Shell {
             toplevel_enter_workspace(&toplevel, to);
         }
 
+        self.rebuild_surface_index();
         new_pos.map(|pos| (focus_target, pos))
     }
 
@@ -4870,6 +5026,7 @@ impl Shell {
                 workspace.minimized_windows.push(minimized);
             }
         }
+        self.rebuild_surface_index();
     }
 
     pub fn unminimize_request<S>(
@@ -4899,6 +5056,7 @@ impl Shell {
             }
             set.sticky_layer
                 .remap_minimized(window, from, previous_position);
+            self.rebuild_surface_index();
         } else {
             let Some((workspace, window)) = self.workspaces.spaces_mut().find_map(|w| {
                 w.minimized_windows
@@ -4919,6 +5077,7 @@ impl Shell {
                 toplevel_leave_workspace(&surface, &workspace.handle);
                 self.remap_unfullscreened_window(surface, restore, loop_handle);
             }
+            self.rebuild_surface_index();
         }
     }
 
@@ -4959,6 +5118,7 @@ impl Shell {
             });
             std::mem::drop(state);
             floating_layer.map_maximized(mapped.clone(), original_geometry, animate);
+            self.rebuild_surface_index();
         }
     }
 
@@ -4989,14 +5149,20 @@ impl Shell {
                         None,
                     );
                 }
-                Some(state.original_geometry.size.as_logical())
+                let size = state.original_geometry.size.as_logical();
+                self.rebuild_surface_index();
+                Some(size)
             } else {
                 None
             }
         } else if let Some(workspace) = self.space_for_mut(mapped) {
-            workspace
+            let size = workspace
                 .unmaximize_request(mapped)
-                .map(|geo| geo.size.as_logical())
+                .map(|geo| geo.size.as_logical());
+            if size.is_some() {
+                self.rebuild_surface_index();
+            }
+            size
         } else {
             None
         }
@@ -5312,6 +5478,7 @@ impl Shell {
         }
 
         self.append_focus_stack(mapped.clone(), seat);
+        self.rebuild_surface_index();
     }
 
     pub fn toggle_sticky_current(&mut self, seat: &Seat<State>) {
@@ -5453,6 +5620,7 @@ impl Shell {
             self.remap_unfullscreened_window(old_fullscreen, restore, loop_handle);
         }
 
+        self.rebuild_surface_index();
         Some(KeyboardFocusTarget::Fullscreen(window))
     }
 
@@ -5476,6 +5644,7 @@ impl Shell {
             toplevel_leave_workspace(&old_fullscreen, &workspace.handle);
 
             let window = self.remap_unfullscreened_window(old_fullscreen, restore, loop_handle);
+            self.rebuild_surface_index();
             Some(KeyboardFocusTarget::Element(window))
         } else {
             None

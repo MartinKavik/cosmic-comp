@@ -37,6 +37,7 @@ impl WlrLayerShellHandler for State {
             output,
             seat,
         });
+        shell.rebuild_surface_index();
     }
 
     fn new_popup(&mut self, _parent: WlrLayerSurface, popup: PopupSurface) {
@@ -74,6 +75,7 @@ impl WlrLayerShellHandler for State {
             }
 
             shell.workspaces.recalculate();
+            shell.rebuild_surface_index();
 
             self.backend.schedule_render(&output);
         }

@@ -37,6 +37,7 @@ impl SessionLockHandler for State {
             ext_session_lock,
             surfaces: HashMap::new(),
         });
+        shell.rebuild_surface_index();
 
         for output in shell.outputs() {
             self.backend.schedule_render(output);
@@ -46,6 +47,7 @@ impl SessionLockHandler for State {
     fn unlock(&mut self) {
         let mut shell = self.common.shell.write();
         shell.session_lock = None;
+        shell.rebuild_surface_index();
 
         for output in shell.outputs() {
             self.backend.schedule_render(output);
@@ -65,6 +67,7 @@ impl SessionLockHandler for State {
             session_lock
                 .surfaces
                 .insert(output.clone(), lock_surface.clone());
+            shell.rebuild_surface_index();
         }
     }
 }
