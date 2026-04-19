@@ -59,7 +59,7 @@ use smithay::{
     },
     xwayland::X11Surface,
 };
-use tracing::error;
+use tracing::{error, info};
 
 use crate::{
     backend::render::animations::spring::{Spring, SpringParams},
@@ -122,6 +122,33 @@ const ACTIVATION_TOKEN_EXPIRE_TIME: Duration = Duration::from_secs(5);
 struct SurfaceCommitLookupCache {
     output: Mutex<Option<WeakOutput>>,
     element: Mutex<Option<CosmicMappedKey>>,
+}
+
+#[derive(Debug, Default)]
+struct SurfaceLookupCounters {
+    output_hint_hits: u64,
+    output_hint_misses: u64,
+    output_hint_stale: u64,
+    output_hint_fallbacks: u64,
+    element_hint_hits: u64,
+    element_hint_misses: u64,
+    element_hint_stale: u64,
+    element_hint_fallbacks: u64,
+}
+
+#[derive(Debug)]
+struct SurfaceLookupStats {
+    counters: SurfaceLookupCounters,
+    last_log: Instant,
+}
+
+impl Default for SurfaceLookupStats {
+    fn default() -> Self {
+        Self {
+            counters: SurfaceLookupCounters::default(),
+            last_log: Instant::now(),
+        }
+    }
 }
 
 fn with_surface_commit_lookup_cache<T>(
@@ -289,6 +316,7 @@ pub struct Shell {
     pub seats: Seats,
     pub previous_workspace_idx: Option<(Serial, WeakOutput, usize)>,
     pub xwayland_keyboard_grab: Option<XWaylandKeyboardGrab<State>>,
+    surface_lookup_stats: Mutex<SurfaceLookupStats>,
 
     theme: cosmic::Theme,
     pub active_hint: bool,
@@ -1608,6 +1636,7 @@ impl Shell {
             session_lock: None,
             previous_workspace_idx: None,
             xwayland_keyboard_grab: None,
+            surface_lookup_stats: Mutex::new(SurfaceLookupStats::default()),
 
             theme,
             active_hint: config.cosmic_conf.active_hint,
@@ -1926,6 +1955,29 @@ impl Shell {
         });
     }
 
+    fn note_surface_lookup_stats(&self, f: impl FnOnce(&mut SurfaceLookupCounters)) {
+        let mut stats = self.surface_lookup_stats.lock().unwrap();
+        f(&mut stats.counters);
+
+        if stats.last_log.elapsed() >= Duration::from_secs(60) {
+            let counters = std::mem::take(&mut stats.counters);
+            stats.last_log = Instant::now();
+            std::mem::drop(stats);
+
+            info!(
+                output_hint_hits = counters.output_hint_hits,
+                output_hint_misses = counters.output_hint_misses,
+                output_hint_stale = counters.output_hint_stale,
+                output_hint_fallbacks = counters.output_hint_fallbacks,
+                element_hint_hits = counters.element_hint_hits,
+                element_hint_misses = counters.element_hint_misses,
+                element_hint_stale = counters.element_hint_stale,
+                element_hint_fallbacks = counters.element_hint_fallbacks,
+                "[perf] surface lookup cache stats"
+            );
+        }
+    }
+
     fn update_surface_lookup_element_cache(surface: &WlSurface, mapped: &CosmicMapped) {
         with_surface_commit_lookup_cache(surface, |cache| {
             *cache.element.lock().unwrap() = Some(mapped.key());
@@ -1941,6 +1993,7 @@ impl Shell {
             .and_then(|output| output.upgrade())
             .and_then(|output| self.outputs().find(|candidate| **candidate == output))
         else {
+            self.note_surface_lookup_stats(|stats| stats.output_hint_misses += 1);
             with_surface_commit_lookup_cache(surface, |cache| {
                 *cache.output.lock().unwrap() = None;
             });
@@ -1948,8 +2001,10 @@ impl Shell {
         };
 
         if self.surface_visible_on_output(surface, output) {
+            self.note_surface_lookup_stats(|stats| stats.output_hint_hits += 1);
             Some(output)
         } else {
+            self.note_surface_lookup_stats(|stats| stats.output_hint_stale += 1);
             with_surface_commit_lookup_cache(surface, |cache| {
                 *cache.output.lock().unwrap() = None;
             });
@@ -1962,6 +2017,7 @@ impl Shell {
             cache.element.lock().unwrap().clone()
         });
 
+        let had_cached = cached.is_some();
         let Some(mapped) = cached.and_then(|key| {
             self.mapped().find(|mapped| {
                 mapped.key() == key
@@ -1969,12 +2025,20 @@ impl Shell {
                         || mapped.has_surface(surface, WindowSurfaceType::ALL))
             })
         }) else {
+            self.note_surface_lookup_stats(|stats| {
+                if had_cached {
+                    stats.element_hint_stale += 1;
+                } else {
+                    stats.element_hint_misses += 1;
+                }
+            });
             with_surface_commit_lookup_cache(surface, |cache| {
                 *cache.element.lock().unwrap() = None;
             });
             return None;
         };
 
+        self.note_surface_lookup_stats(|stats| stats.element_hint_hits += 1);
         Some(mapped)
     }
 
@@ -2159,6 +2223,7 @@ impl Shell {
         if let Some(output) = output {
             Self::update_surface_lookup_output_cache(surface, output);
         }
+        self.note_surface_lookup_stats(|stats| stats.output_hint_fallbacks += 1);
 
         output
     }
@@ -2172,6 +2237,7 @@ impl Shell {
         if let Some(mapped) = mapped {
             Self::update_surface_lookup_element_cache(surface, mapped);
         }
+        self.note_surface_lookup_stats(|stats| stats.element_hint_fallbacks += 1);
         mapped
     }
 
