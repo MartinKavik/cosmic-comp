@@ -2526,6 +2526,52 @@ impl Shell {
         None
     }
 
+    fn indexed_workspace_for_surface(&self, surface: &WlSurface) -> Option<(WorkspaceHandle, Output)> {
+        self.ensure_surface_index_populated();
+        let entry = self.surface_index_entry(surface)?;
+
+        match &entry.role {
+            SurfaceIndexRole::Layer { output } | SurfaceIndexRole::PendingLayer { output } => {
+                let output = self.output_from_weak(output)?;
+                self.workspaces
+                    .spaces()
+                    .find(|workspace| workspace.output() == output)
+                    .map(|workspace| (workspace.handle, output.clone()))
+            }
+            SurfaceIndexRole::WorkspaceMapped { workspace, .. }
+            | SurfaceIndexRole::WorkspaceMinimized { workspace, .. }
+            | SurfaceIndexRole::WorkspaceFullscreen { workspace } => {
+                let workspace = self.workspaces.space_for_handle(workspace)?;
+                let matches = match &entry.role {
+                    SurfaceIndexRole::WorkspaceMapped { .. } => workspace
+                        .mapped()
+                        .any(|mapped| mapped.has_surface(surface, WindowSurfaceType::ALL)),
+                    SurfaceIndexRole::WorkspaceMinimized { .. } => workspace
+                        .minimized_windows
+                        .iter()
+                        .any(|window| {
+                            window
+                                .mapped()
+                                .is_some_and(|mapped| mapped.has_surface(surface, WindowSurfaceType::ALL))
+                        }),
+                    SurfaceIndexRole::WorkspaceFullscreen { .. } => workspace
+                        .get_fullscreen()
+                        .is_some_and(|window| window.has_surface(surface, WindowSurfaceType::ALL)),
+                    _ => false,
+                };
+
+                matches.then(|| (workspace.handle, workspace.output().clone()))
+            }
+            SurfaceIndexRole::Sticky { .. }
+            | SurfaceIndexRole::SetMinimized { .. }
+            | SurfaceIndexRole::SessionLock { .. }
+            | SurfaceIndexRole::Cursor { .. }
+            | SurfaceIndexRole::MoveGrab { .. }
+            | SurfaceIndexRole::DndIcon { .. }
+            | SurfaceIndexRole::OverrideRedirect { .. } => None,
+        }
+    }
+
     fn cached_output_hint_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
         let cached = with_surface_commit_lookup_cache(surface, |cache| {
             cache.output.lock().unwrap().clone()
@@ -2792,6 +2838,10 @@ impl Shell {
     }
 
     pub fn workspace_for_surface(&self, surface: &WlSurface) -> Option<(WorkspaceHandle, Output)> {
+        if let Some(workspace) = self.indexed_workspace_for_surface(surface) {
+            return Some(workspace);
+        }
+
         match self.outputs().find(|o| {
             let map = layer_map_for_output(o);
             map.layer_for_surface(surface, WindowSurfaceType::ALL)
