@@ -650,8 +650,8 @@ fn surface_thread(
                     .schedule_metrics
                     .schedule_thread_commands
                     .fetch_add(1, Ordering::Relaxed);
-                state.render_request_pending.store(false, Ordering::Release);
                 if !startup_done.load(Ordering::SeqCst) {
+                    state.render_request_pending.store(false, Ordering::Release);
                     state
                         .schedule_metrics
                         .schedule_startup_skips
@@ -1137,6 +1137,9 @@ impl SurfaceThreadState {
 
     #[profiling::function]
     fn redraw(&mut self, estimated_presentation: Duration) -> Result<()> {
+        // Accept one new future redraw request while we work on the currently queued one.
+        self.render_request_pending.store(false, Ordering::Release);
+
         let Some(compositor) = self.compositor.as_mut() else {
             return Ok(());
         };
