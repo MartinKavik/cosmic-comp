@@ -125,6 +125,7 @@ struct SurfaceCommitLookupCache {
     output: Mutex<Option<WeakOutput>>,
     element: Mutex<Option<CosmicMappedKey>>,
     fallback_backoff: Mutex<SurfaceFallbackBackoffState>,
+    visible_schedule: Mutex<VisibleCommitScheduleState>,
 }
 
 #[derive(Default)]
@@ -137,6 +138,12 @@ struct SurfaceFallbackBackoffState {
     output_last_miss: Option<Instant>,
     output_backoff_until: Option<Instant>,
     output_last_backoff_attempt: Option<Instant>,
+}
+
+#[derive(Default)]
+struct VisibleCommitScheduleState {
+    output: Option<WeakOutput>,
+    last_schedule: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -331,6 +338,7 @@ struct SurfaceLookupCounters {
     commit_schedule_from_layer: u64,
     commit_schedule_from_visible: u64,
     commit_schedule_misses: u64,
+    commit_schedule_visible_backoff_skips: u64,
     commit_layer_arrange_changed: u64,
     commit_layer_arrange_unchanged: u64,
     commit_layer_arrange_skipped_unchanged: u64,
@@ -2222,6 +2230,8 @@ impl Shell {
                 commit_schedule_from_layer = counters.commit_schedule_from_layer,
                 commit_schedule_from_visible = counters.commit_schedule_from_visible,
                 commit_schedule_misses = counters.commit_schedule_misses,
+                commit_schedule_visible_backoff_skips =
+                    counters.commit_schedule_visible_backoff_skips,
                 commit_layer_arrange_changed = counters.commit_layer_arrange_changed,
                 commit_layer_arrange_unchanged = counters.commit_layer_arrange_unchanged,
                 commit_layer_arrange_skipped_unchanged =
@@ -2307,6 +2317,10 @@ impl Shell {
         });
     }
 
+    pub fn note_commit_schedule_visible_backoff_skip(&self) {
+        self.note_surface_lookup_stats(|stats| stats.commit_schedule_visible_backoff_skips += 1);
+    }
+
     pub fn note_commit_layer_arrange(&self, changed: bool) {
         self.note_surface_lookup_stats(|stats| {
             if changed {
@@ -2379,6 +2393,40 @@ impl Shell {
     fn surface_index_role(&self, surface: &WlSurface) -> Option<SurfaceIndexRole> {
         self.ensure_surface_index_populated();
         self.surface_index_entry(surface).map(|entry| entry.role)
+    }
+
+    pub fn should_schedule_visible_commit(&self, surface: &WlSurface, output: &Output) -> bool {
+        const MIN_VISIBLE_COMMIT_SCHEDULE_INTERVAL: Duration = Duration::from_millis(8);
+
+        let now = Instant::now();
+        let allowed = with_surface_commit_lookup_cache(surface, |cache| {
+            let mut state = cache.visible_schedule.lock().unwrap();
+
+            let same_output_recent = state
+                .output
+                .as_ref()
+                .and_then(|weak| weak.upgrade())
+                .is_some_and(|cached_output| {
+                    cached_output == *output
+                        && state
+                            .last_schedule
+                            .is_some_and(|last| now.duration_since(last) < MIN_VISIBLE_COMMIT_SCHEDULE_INTERVAL)
+                });
+
+            if same_output_recent {
+                false
+            } else {
+                state.output = Some(output.downgrade());
+                state.last_schedule = Some(now);
+                true
+            }
+        });
+
+        if !allowed {
+            self.note_commit_schedule_visible_backoff_skip();
+        }
+
+        allowed
     }
 
     fn allow_surface_lookup_fallback(

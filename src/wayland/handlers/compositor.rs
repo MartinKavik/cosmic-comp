@@ -279,10 +279,17 @@ impl CompositorHandler for State {
         };
 
         // schedule a new render
-        if let Some(output) = layer_output.as_ref().or(visible_output.as_ref()) {
+        let should_schedule_visible = visible_output
+            .as_ref()
+            .is_some_and(|output| shell.should_schedule_visible_commit(surface, output));
+
+        if let Some(output) = layer_output
+            .as_ref()
+            .or(should_schedule_visible.then_some(visible_output.as_ref()).flatten())
+        {
             self.backend.schedule_render(output);
         }
-        shell.note_commit_schedule_source(layer_output.is_some(), visible_output.is_some());
+        shell.note_commit_schedule_source(layer_output.is_some(), should_schedule_visible);
 
         if mapped {
             shell.note_commit_mapped_short_circuit();
