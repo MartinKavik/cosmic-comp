@@ -433,6 +433,7 @@ impl ResizeSurfaceGrab {
         });
 
         *mapped.resize_state.lock().unwrap() = Some(resize_state);
+        crate::shell::Shell::track_resize_commit_window(&mapped);
         seat.user_data()
             .get_or_insert::<ResizeGrabMarker, _>(|| ResizeGrabMarker(AtomicBool::new(true)))
             .0
@@ -529,6 +530,7 @@ impl ResizeSurfaceGrab {
                 && !window.is_resizing(false).unwrap_or(false)
             {
                 *resize_state = None;
+                crate::shell::Shell::untrack_resize_commit_window(&window);
             }
             std::mem::drop(resize_state);
 
@@ -578,6 +580,7 @@ impl ResizeSurfaceGrab {
         let mut resize_state = self.window.resize_state.lock().unwrap();
         if let Some(ResizeState::Resizing(resize_data)) = *resize_state {
             *resize_state = Some(ResizeState::WaitingForCommit(resize_data));
+            crate::shell::Shell::track_resize_commit_window(&self.window);
         } else {
             debug!("unexpected resize state: {:?}", resize_state);
         }

@@ -93,10 +93,11 @@ use std::{
     mem,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender},
     },
     thread::JoinHandle,
+    time::Instant,
     time::Duration,
 };
 
@@ -116,6 +117,8 @@ pub struct Surface {
     known_nodes: HashSet<DrmNode>,
 
     active: Arc<AtomicBool>,
+    render_request_pending: Arc<AtomicBool>,
+    schedule_metrics: Arc<SurfaceScheduleMetrics>,
     pub feedback: HashMap<DrmNode, SurfaceDmabufFeedback>,
     pub(super) primary_plane_formats: FormatSet,
     overlay_plane_formats: Option<FormatSet>,
@@ -157,6 +160,9 @@ pub struct SurfaceThreadState {
     egui: EguiState,
 
     last_sequence: Option<u32>,
+    render_request_pending: Arc<AtomicBool>,
+    schedule_metrics: Arc<SurfaceScheduleMetrics>,
+    last_schedule_log: Instant,
     /// Tracy frame that goes from vblank to vblank.
     vblank_frame: Option<tracy_client::Frame>,
     /// Frame name for the VBlank frame.
@@ -230,6 +236,21 @@ pub enum SurfaceCommand {
 }
 
 #[derive(Debug, Default)]
+struct SurfaceScheduleMetrics {
+    schedule_requested: AtomicU64,
+    schedule_dispatched: AtomicU64,
+    schedule_suppressed_pending: AtomicU64,
+    schedule_thread_commands: AtomicU64,
+    schedule_startup_skips: AtomicU64,
+    schedule_dpms_off_skips: AtomicU64,
+    queue_redraw_queued_new: AtomicU64,
+    queue_redraw_queued_from_estimated_vblank: AtomicU64,
+    queue_redraw_already_queued: AtomicU64,
+    queue_redraw_waiting_for_vblank: AtomicU64,
+    queue_redraw_force_replaced: AtomicU64,
+}
+
+#[derive(Debug, Default)]
 struct PrePostprocessData {
     states: Option<RenderElementStates>,
     texture: Option<GlesTexture>,
@@ -253,9 +274,13 @@ impl Surface {
         let (tx, rx) = channel::<ThreadCommand>();
         let (tx2, rx2) = channel::<SurfaceCommand>();
         let active = Arc::new(AtomicBool::new(false));
+        let render_request_pending = Arc::new(AtomicBool::new(false));
+        let schedule_metrics = Arc::new(SurfaceScheduleMetrics::default());
 
         let active_clone = active.clone();
         let output_clone = output.clone();
+        let render_request_pending_clone = render_request_pending.clone();
+        let schedule_metrics_clone = schedule_metrics.clone();
 
         let thread = std::thread::Builder::new()
             .name(format!("surface-{}", output.name()))
@@ -266,6 +291,8 @@ impl Surface {
                     target_node,
                     shell,
                     active_clone,
+                    render_request_pending_clone,
+                    schedule_metrics_clone,
                     screen_filter,
                     tx2,
                     rx,
@@ -339,6 +366,8 @@ impl Surface {
             output: output.clone(),
             known_nodes: HashSet::new(),
             active,
+            render_request_pending,
+            schedule_metrics,
             feedback: HashMap::new(),
             primary_plane_formats: FormatSet::default(),
             overlay_plane_formats: None,
@@ -387,8 +416,30 @@ impl Surface {
     }
 
     pub fn schedule_render(&self) {
-        if self.dpms {
-            let _ = self.thread_command.send(ThreadCommand::ScheduleRender);
+        self.schedule_metrics
+            .schedule_requested
+            .fetch_add(1, Ordering::Relaxed);
+
+        if !self.dpms {
+            self.schedule_metrics
+                .schedule_dpms_off_skips
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        if self.render_request_pending.swap(true, Ordering::AcqRel) {
+            self.schedule_metrics
+                .schedule_suppressed_pending
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        self.schedule_metrics
+            .schedule_dispatched
+            .fetch_add(1, Ordering::Relaxed);
+
+        if self.thread_command.send(ThreadCommand::ScheduleRender).is_err() {
+            self.render_request_pending.store(false, Ordering::Release);
         }
     }
 
@@ -425,6 +476,7 @@ impl Surface {
     }
 
     pub fn suspend(&mut self) {
+        self.render_request_pending.store(false, Ordering::Release);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::Suspend(tx));
         let _ = rx.recv();
@@ -440,6 +492,7 @@ impl Surface {
         self.overlay_plane_formats = overlay_plane_formats;
         self.feedback.clear();
         self.active.store(true, Ordering::SeqCst);
+        self.render_request_pending.store(false, Ordering::Release);
 
         let _ = self
             .thread_command
@@ -456,6 +509,7 @@ impl Surface {
             if on {
                 self.schedule_render();
             } else {
+                self.render_request_pending.store(false, Ordering::Release);
                 let _ = self.thread_command.send(ThreadCommand::DpmsOff);
             }
         }
@@ -494,6 +548,8 @@ fn surface_thread(
     target_node: DrmNode,
     shell: Arc<parking_lot::RwLock<Shell>>,
     active: Arc<AtomicBool>,
+    render_request_pending: Arc<AtomicBool>,
+    schedule_metrics: Arc<SurfaceScheduleMetrics>,
     screen_filter: ScreenFilter,
     thread_sender: Sender<SurfaceCommand>,
     thread_receiver: Channel<ThreadCommand>,
@@ -553,6 +609,9 @@ fn surface_thread(
         egui,
 
         last_sequence: None,
+        render_request_pending,
+        schedule_metrics,
+        last_schedule_log: Instant::now(),
         vblank_frame: None,
         vblank_frame_name,
         time_since_presentation_plot_name,
@@ -587,11 +646,22 @@ fn surface_thread(
                 state.on_vblank(metadata);
             }
             Event::Msg(ThreadCommand::ScheduleRender) => {
+                state
+                    .schedule_metrics
+                    .schedule_thread_commands
+                    .fetch_add(1, Ordering::Relaxed);
+                state.render_request_pending.store(false, Ordering::Release);
                 if !startup_done.load(Ordering::SeqCst) {
+                    state
+                        .schedule_metrics
+                        .schedule_startup_skips
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.maybe_log_schedule_metrics();
                     return;
                 }
 
                 state.queue_redraw(false);
+                state.maybe_log_schedule_metrics();
             }
             Event::Msg(ThreadCommand::UpdateMirroring(mirroring_output)) => {
                 state.update_mirroring(mirroring_output);
@@ -665,8 +735,66 @@ fn surface_thread(
 }
 
 impl SurfaceThreadState {
+    fn maybe_log_schedule_metrics(&mut self) {
+        if self.last_schedule_log.elapsed() < Duration::from_secs(60) {
+            return;
+        }
+
+        self.last_schedule_log = Instant::now();
+
+        warn!(
+            output = self.output.name(),
+            schedule_requested = self
+                .schedule_metrics
+                .schedule_requested
+                .swap(0, Ordering::Relaxed),
+            schedule_dispatched = self
+                .schedule_metrics
+                .schedule_dispatched
+                .swap(0, Ordering::Relaxed),
+            schedule_suppressed_pending = self
+                .schedule_metrics
+                .schedule_suppressed_pending
+                .swap(0, Ordering::Relaxed),
+            schedule_thread_commands = self
+                .schedule_metrics
+                .schedule_thread_commands
+                .swap(0, Ordering::Relaxed),
+            schedule_startup_skips = self
+                .schedule_metrics
+                .schedule_startup_skips
+                .swap(0, Ordering::Relaxed),
+            schedule_dpms_off_skips = self
+                .schedule_metrics
+                .schedule_dpms_off_skips
+                .swap(0, Ordering::Relaxed),
+            queue_redraw_queued_new = self
+                .schedule_metrics
+                .queue_redraw_queued_new
+                .swap(0, Ordering::Relaxed),
+            queue_redraw_queued_from_estimated_vblank = self
+                .schedule_metrics
+                .queue_redraw_queued_from_estimated_vblank
+                .swap(0, Ordering::Relaxed),
+            queue_redraw_already_queued = self
+                .schedule_metrics
+                .queue_redraw_already_queued
+                .swap(0, Ordering::Relaxed),
+            queue_redraw_waiting_for_vblank = self
+                .schedule_metrics
+                .queue_redraw_waiting_for_vblank
+                .swap(0, Ordering::Relaxed),
+            queue_redraw_force_replaced = self
+                .schedule_metrics
+                .queue_redraw_force_replaced
+                .swap(0, Ordering::Relaxed),
+            "[perf] surface schedule stats"
+        );
+    }
+
     fn suspend(&mut self, tx: SyncSender<()>) {
         self.active.store(false, Ordering::SeqCst);
+        self.render_request_pending.store(false, Ordering::Release);
         let _ = self.compositor.take();
 
         match std::mem::replace(&mut self.state, QueueState::Idle) {
@@ -688,6 +816,7 @@ impl SurfaceThreadState {
     }
 
     fn resume(&mut self, compositor: GbmDrmOutput) {
+        self.render_request_pending.store(false, Ordering::Release);
         let (mode, min_hz) = compositor.with_compositor(|c| {
             (
                 c.surface().pending_mode(),
@@ -919,6 +1048,9 @@ impl SurfaceThreadState {
 
         if let QueueState::WaitingForVBlank { .. } = &self.state {
             // We're waiting for VBlank, request a redraw afterwards.
+            self.schedule_metrics
+                .queue_redraw_waiting_for_vblank
+                .fetch_add(1, Ordering::Relaxed);
             self.state = QueueState::WaitingForVBlank {
                 redraw_needed: true,
             };
@@ -931,6 +1063,9 @@ impl SurfaceThreadState {
 
                 // A redraw is already queued.
                 QueueState::Queued(_) | QueueState::WaitingForEstimatedVBlankAndQueued { .. } => {
+                    self.schedule_metrics
+                        .queue_redraw_already_queued
+                        .fetch_add(1, Ordering::Relaxed);
                     return;
                 }
                 _ => unreachable!(),
@@ -962,15 +1097,24 @@ impl SurfaceThreadState {
 
         match &self.state {
             QueueState::Idle => {
+                self.schedule_metrics
+                    .queue_redraw_queued_new
+                    .fetch_add(1, Ordering::Relaxed);
                 self.state = QueueState::Queued(token);
             }
             QueueState::WaitingForEstimatedVBlank(estimated_vblank) => {
+                self.schedule_metrics
+                    .queue_redraw_queued_from_estimated_vblank
+                    .fetch_add(1, Ordering::Relaxed);
                 self.state = QueueState::WaitingForEstimatedVBlankAndQueued {
                     estimated_vblank: *estimated_vblank,
                     queued_render: token,
                 };
             }
             QueueState::Queued(old_token) if force => {
+                self.schedule_metrics
+                    .queue_redraw_force_replaced
+                    .fetch_add(1, Ordering::Relaxed);
                 self.loop_handle.remove(*old_token);
                 self.state = QueueState::Queued(token);
             }
@@ -978,6 +1122,9 @@ impl SurfaceThreadState {
                 estimated_vblank,
                 queued_render,
             } if force => {
+                self.schedule_metrics
+                    .queue_redraw_force_replaced
+                    .fetch_add(1, Ordering::Relaxed);
                 self.loop_handle.remove(*queued_render);
                 self.state = QueueState::WaitingForEstimatedVBlankAndQueued {
                     estimated_vblank: *estimated_vblank,

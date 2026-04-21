@@ -355,22 +355,28 @@ impl CompositorHandler for State {
             // If we would re-position the window inside the grab we would get a weird jittery animation.
             // We only want to resize once the client has acknoledged & commited the new size,
             // so we need to carefully track the state through different handlers.
-            if let Some(element) = shell.resizing_element_for_surface(surface).cloned() {
-                shell.note_commit_resize_lookup(true);
-                crate::shell::layout::floating::ResizeSurfaceGrab::apply_resize_to_location(
-                    element,
-                    &mut shell,
-                );
+            if shell.has_pending_resize_commits() {
+                if let Some(element) = shell.resizing_element_for_surface(surface).cloned() {
+                    shell.note_commit_resize_lookup(true);
+                    crate::shell::layout::floating::ResizeSurfaceGrab::apply_resize_to_location(
+                        element,
+                        &mut shell,
+                    );
+                } else {
+                    shell.note_commit_resize_lookup(false);
+                }
             } else {
-                shell.note_commit_resize_lookup(false);
+                shell.note_commit_resize_lookup_skipped_no_resize();
             }
         }
 
         if let Some(output) = layer_output {
-            let changed = layer_map_for_output(&output).arrange();
-            shell.note_commit_layer_arrange(changed);
-            if changed {
-                shell.workspaces.recalculate();
+            if shell.should_arrange_layer_commit(surface, &output) {
+                let changed = layer_map_for_output(&output).arrange();
+                shell.note_commit_layer_arrange(changed);
+                if changed {
+                    shell.workspaces.recalculate();
+                }
             }
         }
     }

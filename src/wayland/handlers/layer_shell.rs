@@ -55,6 +55,7 @@ impl WlrLayerShellHandler for State {
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         let mut shell = self.common.shell.write();
+        shell.clear_layer_commit_guard(surface.wl_surface());
         let maybe_output = shell
             .outputs()
             .find(|o| {

@@ -4,8 +4,8 @@ use grabs::{MenuAlignment, SeatMoveGrabState};
 use indexmap::IndexMap;
 use layout::TilingExceptions;
 use std::{
-    collections::HashMap,
-    sync::{Mutex, atomic::Ordering},
+    collections::{HashMap, HashSet},
+    sync::{LazyLock, Mutex, atomic::Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -53,7 +53,9 @@ use smithay::{
         compositor::{SurfaceAttributes, with_states},
         seat::WaylandFocus,
         session_lock::LockSurface,
-        shell::wlr_layer::{KeyboardInteractivity, Layer, LayerSurfaceCachedState},
+        shell::wlr_layer::{
+            Anchor, ExclusiveZone, KeyboardInteractivity, Layer, LayerSurfaceCachedState,
+        },
         xdg_activation::XdgActivationState,
         xwayland_keyboard_grab::XWaylandKeyboardGrab,
     },
@@ -122,6 +124,67 @@ const ACTIVATION_TOKEN_EXPIRE_TIME: Duration = Duration::from_secs(5);
 struct SurfaceCommitLookupCache {
     output: Mutex<Option<WeakOutput>>,
     element: Mutex<Option<CosmicMappedKey>>,
+    fallback_backoff: Mutex<SurfaceFallbackBackoffState>,
+}
+
+#[derive(Default)]
+struct SurfaceFallbackBackoffState {
+    element_consecutive_misses: u8,
+    element_last_miss: Option<Instant>,
+    element_backoff_until: Option<Instant>,
+    element_last_backoff_attempt: Option<Instant>,
+    output_consecutive_misses: u8,
+    output_last_miss: Option<Instant>,
+    output_backoff_until: Option<Instant>,
+    output_last_backoff_attempt: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LookupFallbackKind {
+    Element,
+    Output,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LayerLayoutKey {
+    output: WeakOutput,
+    size: Size<i32, Logical>,
+    anchor: Anchor,
+    exclusive_zone: ExclusiveZone,
+    exclusive_edge: Option<Anchor>,
+    margin_top: i32,
+    margin_right: i32,
+    margin_bottom: i32,
+    margin_left: i32,
+    keyboard_interactivity: KeyboardInteractivity,
+    layer: Layer,
+}
+
+#[derive(Debug, Default)]
+struct LayerCommitGuardState {
+    last_layout_key: Option<LayerLayoutKey>,
+    unchanged_window_start: Option<Instant>,
+    unchanged_burst: u32,
+    backoff_until: Option<Instant>,
+}
+
+impl LayerLayoutKey {
+    fn from_layer_surface(output: &Output, layer_surface: &LayerSurface) -> Self {
+        let state = layer_surface.cached_state();
+        Self {
+            output: output.downgrade(),
+            size: state.size,
+            anchor: state.anchor,
+            exclusive_zone: state.exclusive_zone,
+            exclusive_edge: state.exclusive_edge,
+            margin_top: state.margin.top,
+            margin_right: state.margin.right,
+            margin_bottom: state.margin.bottom,
+            margin_left: state.margin.left,
+            keyboard_interactivity: state.keyboard_interactivity,
+            layer: state.layer,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -166,6 +229,29 @@ enum SurfaceIndexRole {
     OverrideRedirect {
         output: WeakOutput,
     },
+}
+
+impl SurfaceIndexRole {
+    fn is_mapped_window_role(&self) -> bool {
+        matches!(
+            self,
+            SurfaceIndexRole::Sticky { .. }
+                | SurfaceIndexRole::SetMinimized { .. }
+                | SurfaceIndexRole::WorkspaceMapped { .. }
+                | SurfaceIndexRole::WorkspaceMinimized { .. }
+        )
+    }
+
+    fn can_affect_workspace_lookup(&self) -> bool {
+        matches!(
+            self,
+            SurfaceIndexRole::Layer { .. }
+                | SurfaceIndexRole::PendingLayer { .. }
+                | SurfaceIndexRole::WorkspaceMapped { .. }
+                | SurfaceIndexRole::WorkspaceMinimized { .. }
+                | SurfaceIndexRole::WorkspaceFullscreen { .. }
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -241,11 +327,13 @@ struct SurfaceLookupCounters {
     commit_null_buffer: u64,
     commit_resize_lookup_hits: u64,
     commit_resize_lookup_misses: u64,
+    commit_resize_lookup_skipped_no_resize: u64,
     commit_schedule_from_layer: u64,
     commit_schedule_from_visible: u64,
     commit_schedule_misses: u64,
     commit_layer_arrange_changed: u64,
     commit_layer_arrange_unchanged: u64,
+    commit_layer_arrange_skipped_unchanged: u64,
     visible_path_primary_scanout: u64,
     visible_path_session_lock: u64,
     visible_path_index: u64,
@@ -267,6 +355,8 @@ struct SurfaceLookupCounters {
     element_index_hits: u64,
     element_index_misses: u64,
     element_index_stale: u64,
+    element_index_role_skips: u64,
+    element_hint_role_skips: u64,
     workspace_index_hits: u64,
     workspace_index_misses: u64,
     workspace_index_stale: u64,
@@ -274,6 +364,9 @@ struct SurfaceLookupCounters {
     index_rebuild_entries_total: u64,
     index_rebuild_us_total: u64,
     index_rebuild_us_max: u64,
+    layer_arrange_backoff_activations: u64,
+    lookup_fallback_backoff_activations: u64,
+    lookup_fallback_backoff_skips: u64,
 }
 
 #[derive(Debug)]
@@ -457,6 +550,7 @@ pub struct Shell {
     pub previous_workspace_idx: Option<(Serial, WeakOutput, usize)>,
     pub xwayland_keyboard_grab: Option<XWaylandKeyboardGrab<State>>,
     surface_index: Mutex<HashMap<ObjectId, SurfaceIndexEntry>>,
+    layer_commit_guards: Mutex<HashMap<ObjectId, LayerCommitGuardState>>,
     surface_lookup_stats: Mutex<SurfaceLookupStats>,
 
     theme: cosmic::Theme,
@@ -486,6 +580,9 @@ pub struct SessionLock {
     pub ext_session_lock: ExtSessionLockV1,
     pub surfaces: HashMap<Output, LockSurface>,
 }
+
+static PENDING_RESIZE_COMMIT_WINDOWS: LazyLock<Mutex<HashSet<CosmicMappedKey>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[derive(Debug, Clone, Copy)]
 pub enum WorkspaceDelta {
@@ -1745,7 +1842,13 @@ impl Common {
                 });
             }
 
-            if let Some(mapped) = shell.cached_element_for_surface(surface) {
+            let should_lookup_mapped = shell
+                .surface_index_role(surface)
+                .map(|role| role.is_mapped_window_role())
+                .unwrap_or(true);
+            if should_lookup_mapped
+                && let Some(mapped) = shell.cached_element_for_surface(surface)
+            {
                 mapped.on_commit(surface);
             }
             if let Some(surface) = shell
@@ -1778,6 +1881,7 @@ impl Shell {
             previous_workspace_idx: None,
             xwayland_keyboard_grab: None,
             surface_index: Mutex::new(HashMap::new()),
+            layer_commit_guards: Mutex::new(HashMap::new()),
             surface_lookup_stats: Mutex::new(SurfaceLookupStats::default()),
 
             theme,
@@ -2113,11 +2217,15 @@ impl Shell {
                 commit_null_buffer = counters.commit_null_buffer,
                 commit_resize_lookup_hits = counters.commit_resize_lookup_hits,
                 commit_resize_lookup_misses = counters.commit_resize_lookup_misses,
+                commit_resize_lookup_skipped_no_resize =
+                    counters.commit_resize_lookup_skipped_no_resize,
                 commit_schedule_from_layer = counters.commit_schedule_from_layer,
                 commit_schedule_from_visible = counters.commit_schedule_from_visible,
                 commit_schedule_misses = counters.commit_schedule_misses,
                 commit_layer_arrange_changed = counters.commit_layer_arrange_changed,
                 commit_layer_arrange_unchanged = counters.commit_layer_arrange_unchanged,
+                commit_layer_arrange_skipped_unchanged =
+                    counters.commit_layer_arrange_skipped_unchanged,
                 visible_path_primary_scanout = counters.visible_path_primary_scanout,
                 visible_path_session_lock = counters.visible_path_session_lock,
                 visible_path_index = counters.visible_path_index,
@@ -2139,6 +2247,8 @@ impl Shell {
                 element_index_hits = counters.element_index_hits,
                 element_index_misses = counters.element_index_misses,
                 element_index_stale = counters.element_index_stale,
+                element_index_role_skips = counters.element_index_role_skips,
+                element_hint_role_skips = counters.element_hint_role_skips,
                 workspace_index_hits = counters.workspace_index_hits,
                 workspace_index_misses = counters.workspace_index_misses,
                 workspace_index_stale = counters.workspace_index_stale,
@@ -2146,6 +2256,10 @@ impl Shell {
                 index_rebuild_entries_total = counters.index_rebuild_entries_total,
                 index_rebuild_us_total = counters.index_rebuild_us_total,
                 index_rebuild_us_max = counters.index_rebuild_us_max,
+                layer_arrange_backoff_activations = counters.layer_arrange_backoff_activations,
+                lookup_fallback_backoff_activations =
+                    counters.lookup_fallback_backoff_activations,
+                lookup_fallback_backoff_skips = counters.lookup_fallback_backoff_skips,
                 "[perf] surface lookup cache stats"
             );
         }
@@ -2177,6 +2291,10 @@ impl Shell {
         });
     }
 
+    pub fn note_commit_resize_lookup_skipped_no_resize(&self) {
+        self.note_surface_lookup_stats(|stats| stats.commit_resize_lookup_skipped_no_resize += 1);
+    }
+
     pub fn note_commit_schedule_source(&self, layer_hit: bool, visible_hit: bool) {
         self.note_surface_lookup_stats(|stats| {
             if layer_hit {
@@ -2199,6 +2317,22 @@ impl Shell {
         });
     }
 
+    pub fn note_commit_layer_arrange_skipped_unchanged(&self) {
+        self.note_surface_lookup_stats(|stats| stats.commit_layer_arrange_skipped_unchanged += 1);
+    }
+
+    pub fn note_layer_arrange_backoff_activation(&self) {
+        self.note_surface_lookup_stats(|stats| stats.layer_arrange_backoff_activations += 1);
+    }
+
+    pub fn note_lookup_fallback_backoff_activation(&self) {
+        self.note_surface_lookup_stats(|stats| stats.lookup_fallback_backoff_activations += 1);
+    }
+
+    pub fn note_lookup_fallback_backoff_skip(&self) {
+        self.note_surface_lookup_stats(|stats| stats.lookup_fallback_backoff_skips += 1);
+    }
+
     fn note_visible_output_path(&self, path: &'static str) {
         self.note_surface_lookup_stats(|stats| match path {
             "primary_scanout" => stats.visible_path_primary_scanout += 1,
@@ -2216,6 +2350,164 @@ impl Shell {
         with_surface_commit_lookup_cache(surface, |cache| {
             *cache.element.lock().unwrap() = Some(mapped.key());
         });
+    }
+
+    pub(crate) fn track_resize_commit_window(mapped: &CosmicMapped) {
+        let mut tracked = PENDING_RESIZE_COMMIT_WINDOWS.lock().unwrap();
+        tracked.insert(mapped.key());
+    }
+
+    pub(crate) fn untrack_resize_commit_window(mapped: &CosmicMapped) {
+        let mut tracked = PENDING_RESIZE_COMMIT_WINDOWS.lock().unwrap();
+        tracked.remove(&mapped.key());
+    }
+
+    pub fn has_pending_resize_commits(&self) -> bool {
+        if self.seats.iter().any(|seat| {
+            seat.user_data()
+                .get::<crate::shell::layout::floating::ResizeGrabMarker>()
+                .is_some_and(|marker| marker.get())
+        }) {
+            return true;
+        }
+
+        let mut tracked = PENDING_RESIZE_COMMIT_WINDOWS.lock().unwrap();
+        tracked.retain(|key| key.alive());
+        !tracked.is_empty()
+    }
+
+    fn surface_index_role(&self, surface: &WlSurface) -> Option<SurfaceIndexRole> {
+        self.ensure_surface_index_populated();
+        self.surface_index_entry(surface).map(|entry| entry.role)
+    }
+
+    fn allow_surface_lookup_fallback(
+        &self,
+        surface: &WlSurface,
+        kind: LookupFallbackKind,
+    ) -> bool {
+        const BACKOFF_STEP: Duration = Duration::from_millis(100);
+
+        let now = Instant::now();
+        let allowed = with_surface_commit_lookup_cache(surface, |cache| {
+            let mut state = cache.fallback_backoff.lock().unwrap();
+
+            match kind {
+                LookupFallbackKind::Element => {
+                    if state
+                        .element_backoff_until
+                        .is_some_and(|deadline| deadline > now)
+                    {
+                        if state
+                            .element_last_backoff_attempt
+                            .is_some_and(|last| now.duration_since(last) < BACKOFF_STEP)
+                        {
+                            return false;
+                        }
+                        state.element_last_backoff_attempt = Some(now);
+                        return true;
+                    }
+
+                    state.element_backoff_until = None;
+                    state.element_last_backoff_attempt = Some(now);
+                    true
+                }
+                LookupFallbackKind::Output => {
+                    if state
+                        .output_backoff_until
+                        .is_some_and(|deadline| deadline > now)
+                    {
+                        if state
+                            .output_last_backoff_attempt
+                            .is_some_and(|last| now.duration_since(last) < BACKOFF_STEP)
+                        {
+                            return false;
+                        }
+                        state.output_last_backoff_attempt = Some(now);
+                        return true;
+                    }
+
+                    state.output_backoff_until = None;
+                    state.output_last_backoff_attempt = Some(now);
+                    true
+                }
+            }
+        });
+
+        if !allowed {
+            self.note_lookup_fallback_backoff_skip();
+        }
+
+        allowed
+    }
+
+    fn note_surface_lookup_fallback_result(
+        &self,
+        surface: &WlSurface,
+        kind: LookupFallbackKind,
+        success: bool,
+    ) {
+        const BURST_WINDOW: Duration = Duration::from_millis(500);
+
+        with_surface_commit_lookup_cache(surface, |cache| {
+            let mut state = cache.fallback_backoff.lock().unwrap();
+
+            match kind {
+                LookupFallbackKind::Element => {
+                    if success {
+                        state.element_consecutive_misses = 0;
+                        state.element_last_miss = None;
+                        state.element_backoff_until = None;
+                        return false;
+                    }
+
+                    let now = Instant::now();
+                    if state
+                        .element_last_miss
+                        .is_some_and(|last| now.duration_since(last) <= BURST_WINDOW)
+                    {
+                        state.element_consecutive_misses =
+                            state.element_consecutive_misses.saturating_add(1);
+                    } else {
+                        state.element_consecutive_misses = 1;
+                    }
+                    state.element_last_miss = Some(now);
+
+                    if state.element_consecutive_misses >= 3 {
+                        state.element_backoff_until = Some(now + BURST_WINDOW);
+                        return true;
+                    }
+                    false
+                }
+                LookupFallbackKind::Output => {
+                    if success {
+                        state.output_consecutive_misses = 0;
+                        state.output_last_miss = None;
+                        state.output_backoff_until = None;
+                        return false;
+                    }
+
+                    let now = Instant::now();
+                    if state
+                        .output_last_miss
+                        .is_some_and(|last| now.duration_since(last) <= BURST_WINDOW)
+                    {
+                        state.output_consecutive_misses =
+                            state.output_consecutive_misses.saturating_add(1);
+                    } else {
+                        state.output_consecutive_misses = 1;
+                    }
+                    state.output_last_miss = Some(now);
+
+                    if state.output_consecutive_misses >= 3 {
+                        state.output_backoff_until = Some(now + BURST_WINDOW);
+                        return true;
+                    }
+                    false
+                }
+            }
+        })
+        .then(|| self.note_lookup_fallback_backoff_activation());
     }
 
     fn surface_index_entry(&self, surface: &WlSurface) -> Option<SurfaceIndexEntry> {
@@ -2491,6 +2783,11 @@ impl Shell {
             return None;
         };
 
+        if !entry.role.is_mapped_window_role() {
+            self.note_surface_lookup_stats(|stats| stats.element_index_role_skips += 1);
+            return None;
+        }
+
         if let Some(mapped) = self.mapped_for_index_role(&entry.role, surface) {
             Self::update_surface_lookup_element_cache(surface, mapped);
             self.note_surface_lookup_stats(|stats| stats.element_index_hits += 1);
@@ -2655,6 +2952,11 @@ impl Shell {
             return None;
         };
 
+        if !entry.role.can_affect_workspace_lookup() {
+            self.note_surface_lookup_stats(|stats| stats.workspace_index_misses += 1);
+            return None;
+        }
+
         let workspace = match &entry.role {
             SurfaceIndexRole::Layer { output } | SurfaceIndexRole::PendingLayer { output } => {
                 let output = self.output_from_weak(output)?;
@@ -2687,8 +2989,7 @@ impl Shell {
 
                 matches.then(|| (workspace.handle, workspace.output().clone()))
             }
-            SurfaceIndexRole::Sticky { .. }
-            | SurfaceIndexRole::SetMinimized { .. }
+            SurfaceIndexRole::Sticky { .. } | SurfaceIndexRole::SetMinimized { .. }
             | SurfaceIndexRole::SessionLock { .. }
             | SurfaceIndexRole::Cursor { .. }
             | SurfaceIndexRole::MoveGrab { .. }
@@ -2735,6 +3036,14 @@ impl Shell {
     }
 
     fn cached_element_hint_for_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
+        if self
+            .surface_index_role(surface)
+            .is_some_and(|role| !role.is_mapped_window_role())
+        {
+            self.note_surface_lookup_stats(|stats| stats.element_hint_role_skips += 1);
+            return None;
+        }
+
         let cached = with_surface_commit_lookup_cache(surface, |cache| {
             cache.element.lock().unwrap().clone()
         });
@@ -2804,6 +3113,77 @@ impl Shell {
         }
 
         output
+    }
+
+    fn top_level_layer_surface_for_commit<'a>(
+        &'a self,
+        surface: &WlSurface,
+        output: &'a Output,
+    ) -> Option<LayerSurface> {
+        layer_map_for_output(output)
+            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+            .cloned()
+    }
+
+    pub fn should_arrange_layer_commit(&self, surface: &WlSurface, output: &Output) -> bool {
+        const UNCHANGED_WINDOW: Duration = Duration::from_millis(500);
+        const UNCHANGED_BURST_LIMIT: u32 = 8;
+        const BACKOFF_DURATION: Duration = Duration::from_millis(250);
+
+        let Some(layer_surface) = self.top_level_layer_surface_for_commit(surface, output) else {
+            self.note_commit_layer_arrange_skipped_unchanged();
+            return false;
+        };
+
+        let key = LayerLayoutKey::from_layer_surface(output, &layer_surface);
+        let root_id = layer_surface.wl_surface().id();
+        let now = Instant::now();
+        let mut guards = self.layer_commit_guards.lock().unwrap();
+        let guard = guards.entry(root_id).or_default();
+
+        let changed = guard
+            .last_layout_key
+            .as_ref()
+            .map(|last| last != &key)
+            .unwrap_or(true);
+
+        if changed {
+            guard.last_layout_key = Some(key);
+            guard.unchanged_window_start = None;
+            guard.unchanged_burst = 0;
+            guard.backoff_until = None;
+            return true;
+        }
+
+        if guard
+            .backoff_until
+            .is_some_and(|deadline| deadline > now)
+        {
+            self.note_commit_layer_arrange_skipped_unchanged();
+            return false;
+        }
+
+        if guard
+            .unchanged_window_start
+            .is_some_and(|start| now.duration_since(start) <= UNCHANGED_WINDOW)
+        {
+            guard.unchanged_burst += 1;
+        } else {
+            guard.unchanged_window_start = Some(now);
+            guard.unchanged_burst = 1;
+        }
+
+        if guard.unchanged_burst >= UNCHANGED_BURST_LIMIT {
+            guard.backoff_until = Some(now + BACKOFF_DURATION);
+            self.note_layer_arrange_backoff_activation();
+        }
+
+        self.note_commit_layer_arrange_skipped_unchanged();
+        false
+    }
+
+    pub fn clear_layer_commit_guard(&self, surface: &WlSurface) {
+        self.layer_commit_guards.lock().unwrap().remove(&surface.id());
     }
 
     fn surface_visible_on_output(&self, surface: &WlSurface, output: &Output) -> bool {
@@ -2947,6 +3327,11 @@ impl Shell {
             return Some(output);
         }
 
+        if !self.allow_surface_lookup_fallback(surface, LookupFallbackKind::Output) {
+            self.note_visible_output_path("miss");
+            return None;
+        }
+
         let output = self
             .outputs()
             .find(|output| self.surface_visible_on_output(surface, output));
@@ -2954,8 +3339,10 @@ impl Shell {
         if let Some(output) = output {
             Self::update_surface_lookup_output_cache(surface, output);
             self.note_visible_output_path("full_scan");
+            self.note_surface_lookup_fallback_result(surface, LookupFallbackKind::Output, true);
         } else {
             self.note_visible_output_path("miss");
+            self.note_surface_lookup_fallback_result(surface, LookupFallbackKind::Output, false);
         }
         self.note_surface_lookup_stats(|stats| stats.output_hint_fallbacks += 1);
 
@@ -2963,6 +3350,14 @@ impl Shell {
     }
 
     pub fn cached_element_for_surface(&self, surface: &WlSurface) -> Option<&CosmicMapped> {
+        if self
+            .surface_index_role(surface)
+            .is_some_and(|role| !role.is_mapped_window_role())
+        {
+            self.note_surface_lookup_stats(|stats| stats.element_index_role_skips += 1);
+            return None;
+        }
+
         if let Some(mapped) = self.indexed_element_for_surface(surface) {
             return Some(mapped);
         }
@@ -2971,9 +3366,16 @@ impl Shell {
             return Some(mapped);
         }
 
+        if !self.allow_surface_lookup_fallback(surface, LookupFallbackKind::Element) {
+            return None;
+        }
+
         let mapped = self.element_for_surface(surface);
         if let Some(mapped) = mapped {
             Self::update_surface_lookup_element_cache(surface, mapped);
+            self.note_surface_lookup_fallback_result(surface, LookupFallbackKind::Element, true);
+        } else {
+            self.note_surface_lookup_fallback_result(surface, LookupFallbackKind::Element, false);
         }
         self.note_surface_lookup_stats(|stats| stats.element_hint_fallbacks += 1);
         mapped
@@ -5486,6 +5888,7 @@ impl Shell {
             if let Some(ResizeState::Resizing(data)) = *resize_state {
                 mapped.set_resizing(false);
                 *resize_state = Some(ResizeState::WaitingForCommit(data));
+                Self::track_resize_commit_window(&mapped);
             }
         }
     }

@@ -988,6 +988,7 @@ impl FloatingLayout {
             initial_window_location: original_geo.loc.as_local(),
             initial_window_size: original_geo.size,
         }));
+        crate::shell::Shell::track_resize_commit_window(mapped);
 
         mapped.moved_since_mapped.store(true, Ordering::SeqCst);
         mapped.set_resizing(true);
