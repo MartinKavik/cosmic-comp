@@ -143,7 +143,8 @@ struct SurfaceFallbackBackoffState {
 #[derive(Default)]
 struct VisibleCommitScheduleState {
     output: Option<WeakOutput>,
-    last_schedule: Option<Instant>,
+    window_start: Option<Instant>,
+    burst_count: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2396,28 +2397,34 @@ impl Shell {
     }
 
     pub fn should_schedule_visible_commit(&self, surface: &WlSurface, output: &Output) -> bool {
-        const MIN_VISIBLE_COMMIT_SCHEDULE_INTERVAL: Duration = Duration::from_millis(8);
+        const BURST_WINDOW: Duration = Duration::from_millis(8);
+        const BURST_LIMIT: u8 = 3;
 
         let now = Instant::now();
         let allowed = with_surface_commit_lookup_cache(surface, |cache| {
             let mut state = cache.visible_schedule.lock().unwrap();
 
-            let same_output_recent = state
+            let same_output = state
                 .output
                 .as_ref()
                 .and_then(|weak| weak.upgrade())
-                .is_some_and(|cached_output| {
-                    cached_output == *output
-                        && state
-                            .last_schedule
-                            .is_some_and(|last| now.duration_since(last) < MIN_VISIBLE_COMMIT_SCHEDULE_INTERVAL)
-                });
+                .is_some_and(|cached_output| cached_output == *output);
 
-            if same_output_recent {
-                false
+            if same_output
+                && state
+                    .window_start
+                    .is_some_and(|start| now.duration_since(start) < BURST_WINDOW)
+            {
+                if state.burst_count >= BURST_LIMIT {
+                    false
+                } else {
+                    state.burst_count = state.burst_count.saturating_add(1);
+                    true
+                }
             } else {
                 state.output = Some(output.downgrade());
-                state.last_schedule = Some(now);
+                state.window_start = Some(now);
+                state.burst_count = 1;
                 true
             }
         });
