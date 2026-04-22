@@ -5,8 +5,8 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     ops::ControlFlow,
-    sync::{Arc, Weak},
-    time::Instant,
+    sync::{Arc, LazyLock, Mutex, Weak},
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "debug")]
@@ -76,6 +76,7 @@ use smithay::{
     },
     wayland::{dmabuf::get_dmabuf, session_lock::LockSurface},
 };
+use tracing::warn;
 
 #[cfg(feature = "debug")]
 use smithay_egui::EguiState;
@@ -124,6 +125,284 @@ pub static RECTANGLE_SHADER: &str = include_str!("./shaders/rounded_rectangle.fr
 pub static POSTPROCESS_SHADER: &str = include_str!("./shaders/offscreen.frag");
 pub static GROUP_COLOR: [f32; 3] = [0.788, 0.788, 0.788];
 pub static ACTIVE_GROUP_COLOR: [f32; 3] = [0.58, 0.922, 0.922];
+
+static RENDER_PERF_STATS: LazyLock<Mutex<HashMap<String, RenderPerfLogState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Default, Clone, Copy)]
+struct RenderPerfStageCounters {
+    calls: u64,
+    elements_total: u64,
+    us_total: u64,
+    us_max: u64,
+}
+
+impl RenderPerfStageCounters {
+    fn note(&mut self, duration: Duration, elements: usize) {
+        let us = duration_to_us(duration);
+        self.calls += 1;
+        self.elements_total += elements as u64;
+        self.us_total += us;
+        self.us_max = self.us_max.max(us);
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        self.calls += other.calls;
+        self.elements_total += other.elements_total;
+        self.us_total += other.us_total;
+        self.us_max = self.us_max.max(other.us_max);
+    }
+}
+
+#[derive(Default)]
+struct RenderPerfCounters {
+    output_elements_calls: u64,
+    output_elements_generated_total: u64,
+    output_elements_us_total: u64,
+    output_elements_us_max: u64,
+    workspace_elements_calls: u64,
+    workspace_elements_generated_total: u64,
+    workspace_elements_us_total: u64,
+    workspace_elements_us_max: u64,
+    cursor_calls: u64,
+    cursor_elements_total: u64,
+    cursor_seats_total: u64,
+    cursor_seats_skipped: u64,
+    cursor_us_total: u64,
+    cursor_us_max: u64,
+    render_input_order_calls: u64,
+    render_input_order_us_total: u64,
+    render_input_order_us_max: u64,
+    stage_zoom: RenderPerfStageCounters,
+    stage_session_lock: RenderPerfStageCounters,
+    stage_layer_popup: RenderPerfStageCounters,
+    stage_layer_surface: RenderPerfStageCounters,
+    stage_override_redirect: RenderPerfStageCounters,
+    stage_sticky_popups: RenderPerfStageCounters,
+    stage_sticky: RenderPerfStageCounters,
+    stage_workspace_popups: RenderPerfStageCounters,
+    stage_workspace: RenderPerfStageCounters,
+}
+
+impl RenderPerfCounters {
+    fn note_output_elements(&mut self, duration: Duration, generated: usize) {
+        let us = duration_to_us(duration);
+        self.output_elements_calls += 1;
+        self.output_elements_generated_total += generated as u64;
+        self.output_elements_us_total += us;
+        self.output_elements_us_max = self.output_elements_us_max.max(us);
+    }
+
+    fn note_workspace_elements(&mut self, duration: Duration, generated: usize) {
+        let us = duration_to_us(duration);
+        self.workspace_elements_calls += 1;
+        self.workspace_elements_generated_total += generated as u64;
+        self.workspace_elements_us_total += us;
+        self.workspace_elements_us_max = self.workspace_elements_us_max.max(us);
+    }
+
+    fn note_cursor(
+        &mut self,
+        duration: Duration,
+        generated: usize,
+        seats_total: u64,
+        seats_skipped: u64,
+    ) {
+        let us = duration_to_us(duration);
+        self.cursor_calls += 1;
+        self.cursor_elements_total += generated as u64;
+        self.cursor_seats_total += seats_total;
+        self.cursor_seats_skipped += seats_skipped;
+        self.cursor_us_total += us;
+        self.cursor_us_max = self.cursor_us_max.max(us);
+    }
+
+    fn note_render_input_order(&mut self, duration: Duration) {
+        let us = duration_to_us(duration);
+        self.render_input_order_calls += 1;
+        self.render_input_order_us_total += us;
+        self.render_input_order_us_max = self.render_input_order_us_max.max(us);
+    }
+
+}
+
+struct RenderPerfLogState {
+    last_log: Instant,
+    counters: RenderPerfCounters,
+}
+
+impl Default for RenderPerfLogState {
+    fn default() -> Self {
+        Self {
+            last_log: Instant::now(),
+            counters: RenderPerfCounters::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RenderStageKind {
+    ZoomUi,
+    SessionLock,
+    LayerPopup,
+    LayerSurface,
+    OverrideRedirect,
+    StickyPopups,
+    Sticky,
+    WorkspacePopups,
+    Workspace,
+}
+
+#[derive(Default)]
+struct RenderCallMetrics {
+    cursor: RenderPerfStageCounters,
+    render_input_order: RenderPerfStageCounters,
+    stage_zoom: RenderPerfStageCounters,
+    stage_session_lock: RenderPerfStageCounters,
+    stage_layer_popup: RenderPerfStageCounters,
+    stage_layer_surface: RenderPerfStageCounters,
+    stage_override_redirect: RenderPerfStageCounters,
+    stage_sticky_popups: RenderPerfStageCounters,
+    stage_sticky: RenderPerfStageCounters,
+    stage_workspace_popups: RenderPerfStageCounters,
+    stage_workspace: RenderPerfStageCounters,
+    cursor_seats_total: u64,
+    cursor_seats_skipped: u64,
+}
+
+impl RenderCallMetrics {
+    fn note_stage(&mut self, stage: RenderStageKind, duration: Duration, elements: usize) {
+        match stage {
+            RenderStageKind::ZoomUi => self.stage_zoom.note(duration, elements),
+            RenderStageKind::SessionLock => self.stage_session_lock.note(duration, elements),
+            RenderStageKind::LayerPopup => self.stage_layer_popup.note(duration, elements),
+            RenderStageKind::LayerSurface => self.stage_layer_surface.note(duration, elements),
+            RenderStageKind::OverrideRedirect => {
+                self.stage_override_redirect.note(duration, elements)
+            }
+            RenderStageKind::StickyPopups => self.stage_sticky_popups.note(duration, elements),
+            RenderStageKind::Sticky => self.stage_sticky.note(duration, elements),
+            RenderStageKind::WorkspacePopups => {
+                self.stage_workspace_popups.note(duration, elements)
+            }
+            RenderStageKind::Workspace => self.stage_workspace.note(duration, elements),
+        }
+    }
+
+    fn merge_into(self, counters: &mut RenderPerfCounters) {
+        if self.cursor.calls > 0 {
+            counters.note_cursor(
+                Duration::from_micros(self.cursor.us_total),
+                self.cursor.elements_total as usize,
+                self.cursor_seats_total,
+                self.cursor_seats_skipped,
+            );
+            counters.cursor_us_max = counters.cursor_us_max.max(self.cursor.us_max);
+        }
+        if self.render_input_order.calls > 0 {
+            counters.note_render_input_order(Duration::from_micros(self.render_input_order.us_total));
+            counters.render_input_order_us_max = counters
+                .render_input_order_us_max
+                .max(self.render_input_order.us_max);
+        }
+        counters.stage_zoom.merge_from(&self.stage_zoom);
+        counters
+            .stage_session_lock
+            .merge_from(&self.stage_session_lock);
+        counters.stage_layer_popup.merge_from(&self.stage_layer_popup);
+        counters
+            .stage_layer_surface
+            .merge_from(&self.stage_layer_surface);
+        counters
+            .stage_override_redirect
+            .merge_from(&self.stage_override_redirect);
+        counters
+            .stage_sticky_popups
+            .merge_from(&self.stage_sticky_popups);
+        counters.stage_sticky.merge_from(&self.stage_sticky);
+        counters
+            .stage_workspace_popups
+            .merge_from(&self.stage_workspace_popups);
+        counters.stage_workspace.merge_from(&self.stage_workspace);
+    }
+}
+
+fn duration_to_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn note_render_perf(output: &Output, f: impl FnOnce(&mut RenderPerfCounters)) {
+    let output_name = output.name();
+    let mut stats = RENDER_PERF_STATS.lock().unwrap();
+    let entry = stats.entry(output_name.clone()).or_default();
+    f(&mut entry.counters);
+
+    if entry.last_log.elapsed() < Duration::from_secs(60) {
+        return;
+    }
+
+    let counters = std::mem::take(&mut entry.counters);
+    entry.last_log = Instant::now();
+    std::mem::drop(stats);
+
+    warn!(
+        output = output_name.as_str(),
+        output_elements_calls = counters.output_elements_calls,
+        output_elements_generated_total = counters.output_elements_generated_total,
+        output_elements_us_total = counters.output_elements_us_total,
+        output_elements_us_max = counters.output_elements_us_max,
+        workspace_elements_calls = counters.workspace_elements_calls,
+        workspace_elements_generated_total = counters.workspace_elements_generated_total,
+        workspace_elements_us_total = counters.workspace_elements_us_total,
+        workspace_elements_us_max = counters.workspace_elements_us_max,
+        cursor_calls = counters.cursor_calls,
+        cursor_elements_total = counters.cursor_elements_total,
+        cursor_seats_total = counters.cursor_seats_total,
+        cursor_seats_skipped = counters.cursor_seats_skipped,
+        cursor_us_total = counters.cursor_us_total,
+        cursor_us_max = counters.cursor_us_max,
+        render_input_order_calls = counters.render_input_order_calls,
+        render_input_order_us_total = counters.render_input_order_us_total,
+        render_input_order_us_max = counters.render_input_order_us_max,
+        stage_zoom_calls = counters.stage_zoom.calls,
+        stage_zoom_elements_total = counters.stage_zoom.elements_total,
+        stage_zoom_us_total = counters.stage_zoom.us_total,
+        stage_zoom_us_max = counters.stage_zoom.us_max,
+        stage_session_lock_calls = counters.stage_session_lock.calls,
+        stage_session_lock_elements_total = counters.stage_session_lock.elements_total,
+        stage_session_lock_us_total = counters.stage_session_lock.us_total,
+        stage_session_lock_us_max = counters.stage_session_lock.us_max,
+        stage_layer_popup_calls = counters.stage_layer_popup.calls,
+        stage_layer_popup_elements_total = counters.stage_layer_popup.elements_total,
+        stage_layer_popup_us_total = counters.stage_layer_popup.us_total,
+        stage_layer_popup_us_max = counters.stage_layer_popup.us_max,
+        stage_layer_surface_calls = counters.stage_layer_surface.calls,
+        stage_layer_surface_elements_total = counters.stage_layer_surface.elements_total,
+        stage_layer_surface_us_total = counters.stage_layer_surface.us_total,
+        stage_layer_surface_us_max = counters.stage_layer_surface.us_max,
+        stage_override_redirect_calls = counters.stage_override_redirect.calls,
+        stage_override_redirect_elements_total = counters.stage_override_redirect.elements_total,
+        stage_override_redirect_us_total = counters.stage_override_redirect.us_total,
+        stage_override_redirect_us_max = counters.stage_override_redirect.us_max,
+        stage_sticky_popups_calls = counters.stage_sticky_popups.calls,
+        stage_sticky_popups_elements_total = counters.stage_sticky_popups.elements_total,
+        stage_sticky_popups_us_total = counters.stage_sticky_popups.us_total,
+        stage_sticky_popups_us_max = counters.stage_sticky_popups.us_max,
+        stage_sticky_calls = counters.stage_sticky.calls,
+        stage_sticky_elements_total = counters.stage_sticky.elements_total,
+        stage_sticky_us_total = counters.stage_sticky.us_total,
+        stage_sticky_us_max = counters.stage_sticky.us_max,
+        stage_workspace_popups_calls = counters.stage_workspace_popups.calls,
+        stage_workspace_popups_elements_total = counters.stage_workspace_popups.elements_total,
+        stage_workspace_popups_us_total = counters.stage_workspace_popups.us_total,
+        stage_workspace_popups_us_max = counters.stage_workspace_popups.us_max,
+        stage_workspace_calls = counters.stage_workspace.calls,
+        stage_workspace_elements_total = counters.stage_workspace.elements_total,
+        stage_workspace_us_total = counters.stage_workspace.us_total,
+        stage_workspace_us_max = counters.stage_workspace.us_max,
+        "[perf] render assembly stats"
+    );
+}
 
 pub struct IndicatorShader(pub GlesPixelProgram);
 
@@ -465,6 +744,12 @@ pub enum CursorMode {
     All,
 }
 
+struct CursorElementsResult<E> {
+    elements: Vec<E>,
+    seats_total: u64,
+    seats_skipped: u64,
+}
+
 #[profiling::function]
 pub fn cursor_elements<'a, 'frame, R>(
     renderer: &mut R,
@@ -475,13 +760,14 @@ pub fn cursor_elements<'a, 'frame, R>(
     output: &Output,
     mode: CursorMode,
     exclude_dnd_icon: bool,
-) -> Vec<CosmicElement<R>>
+) -> CursorElementsResult<CosmicElement<R>>
 where
     R: AsGlowRenderer,
     R::TextureId: Send + Clone + 'static,
     CosmicMappedRenderElement<R>: RenderElement<R>,
 {
     let scale = output.current_scale().fractional_scale();
+    let output_geometry = output.geometry().as_logical();
     let (focal_point, zoom_scale) = zoom_state
         .map(|state| {
             (
@@ -491,15 +777,44 @@ where
         })
         .unwrap_or_else(|| ((0., 0.).into(), 1.));
     let mut elements = Vec::new();
+    let mut seats_total = 0;
+    let mut seats_skipped = 0;
+    let cursor_origin = focal_point
+        .as_logical()
+        .to_physical(output.current_scale().fractional_scale())
+        .to_i32_round();
+    let theme = theme.cosmic();
 
     for seat in seats {
+        seats_total += 1;
         let pointer = match seat.get_pointer() {
             Some(ptr) => ptr,
             None => continue,
         };
-        let location = pointer.current_location() - output.current_location().to_f64();
+        let pointer_location = pointer.current_location();
+        let location = pointer_location - output.current_location().to_f64();
+        let pointer_on_output = output_geometry.contains(pointer_location.to_i32_floor());
+        let move_grab_active = seat
+            .user_data()
+            .get::<SeatMoveGrabState>()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_some();
+        let menu_grab_active = seat
+            .user_data()
+            .get::<SeatMenuGrabState>()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .is_some();
 
-        if mode != CursorMode::None {
+        if !pointer_on_output && !move_grab_active && !menu_grab_active {
+            seats_skipped += 1;
+            continue;
+        }
+
+        if mode != CursorMode::None && pointer_on_output {
             elements.extend(
                 cursor::draw_cursor(
                     renderer,
@@ -518,17 +833,14 @@ where
                             Point::from((-hotspot.x, -hotspot.y)),
                             Relocate::Relative,
                         ),
-                        focal_point
-                            .as_logical()
-                            .to_physical(output.current_scale().fractional_scale())
-                            .to_i32_round(),
+                        cursor_origin,
                         zoom_scale,
                     ))
                 }),
             );
         }
 
-        if !exclude_dnd_icon && let Some(dnd_icon) = get_dnd_icon(seat) {
+        if !exclude_dnd_icon && pointer_on_output && let Some(dnd_icon) = get_dnd_icon(seat) {
             elements.extend(
                 cursor::draw_dnd_icon(
                     renderer,
@@ -541,7 +853,6 @@ where
             );
         }
 
-        let theme = theme.cosmic();
         if let Some(grab_elements) = seat
             .user_data()
             .get::<SeatMoveGrabState>()
@@ -554,10 +865,7 @@ where
             elements.extend(grab_elements.into_iter().map(|elem| {
                 CosmicElement::MoveGrab(RescaleRenderElement::from_element(
                     elem,
-                    focal_point
-                        .as_logical()
-                        .to_physical(output.current_scale().fractional_scale())
-                        .to_i32_round(),
+                    cursor_origin,
                     zoom_scale,
                 ))
             }));
@@ -581,10 +889,7 @@ where
                 CosmicElement::MoveGrab(RescaleRenderElement::from_element(
                     elem,
                     if should_scale {
-                        focal_point
-                            .as_logical()
-                            .to_physical(output.current_scale().fractional_scale())
-                            .to_i32_round()
+                        cursor_origin
                     } else {
                         Point::from((0, 0))
                     },
@@ -594,7 +899,11 @@ where
         }
     }
 
-    elements
+    CursorElementsResult {
+        elements,
+        seats_total,
+        seats_skipped,
+    }
 }
 
 #[cfg(not(feature = "debug"))]
@@ -623,6 +932,7 @@ where
     CosmicMappedRenderElement<R>: RenderElement<R>,
     WorkspaceRenderElement<R>: RenderElement<R>,
 {
+    let output_start = Instant::now();
     #[cfg(feature = "debug")]
     let mut debug_elements = {
         let output_geo = output.geometry();
@@ -658,9 +968,18 @@ where
     let shell_guard = shell.read();
     let Some((previous_workspace, workspace)) = shell_guard.workspaces.active(output) else {
         #[cfg(not(feature = "debug"))]
-        return Ok(Vec::new());
+        {
+            note_render_perf(output, |stats| stats.note_output_elements(output_start.elapsed(), 0));
+            return Ok(Vec::new());
+        }
         #[cfg(feature = "debug")]
-        return Ok(debug_elements);
+        {
+            let generated = debug_elements.len();
+            note_render_perf(output, |stats| {
+                stats.note_output_elements(output_start.elapsed(), generated)
+            });
+            return Ok(debug_elements);
+        }
     };
 
     let (previous_idx, idx) = shell_guard.workspaces.active_num(output);
@@ -691,14 +1010,24 @@ where
         cursor_mode,
         element_filter,
     )?;
+    let workspace_len = workspace_elements.len();
 
     #[cfg(feature = "debug")]
     {
         debug_elements.extend(workspace_elements);
+        let generated = debug_elements.len();
+        note_render_perf(output, |stats| {
+            stats.note_output_elements(output_start.elapsed(), generated)
+        });
         Ok(debug_elements)
     }
     #[cfg(not(feature = "debug"))]
-    Ok(workspace_elements)
+    {
+        note_render_perf(output, |stats| {
+            stats.note_output_elements(output_start.elapsed(), workspace_len)
+        });
+        Ok(workspace_elements)
+    }
 }
 
 #[profiling::function]
@@ -721,6 +1050,8 @@ where
     CosmicMappedRenderElement<R>: RenderElement<R>,
     WorkspaceRenderElement<R>: RenderElement<R>,
 {
+    let workspace_start = Instant::now();
+    let mut render_metrics = RenderCallMetrics::default();
     let mut elements = Vec::new();
 
     let shell_ref = shell.read();
@@ -734,7 +1065,8 @@ where
     // that is prone to deadlock with the main-thread on some grabs.
     std::mem::drop(shell_ref);
 
-    elements.extend(cursor_elements(
+    let cursor_start = Instant::now();
+    let cursor_result = cursor_elements(
         renderer,
         seats.iter(),
         zoom_level,
@@ -743,7 +1075,11 @@ where
         output,
         cursor_mode,
         element_filter == ElementFilter::ExcludeWorkspaceOverview,
-    ));
+    );
+    render_metrics.cursor.note(cursor_start.elapsed(), cursor_result.elements.len());
+    render_metrics.cursor_seats_total += cursor_result.seats_total;
+    render_metrics.cursor_seats_skipped += cursor_result.seats_skipped;
+    elements.extend(cursor_result.elements);
 
     let shell = shell.read();
     let overview = shell.overview_mode();
@@ -816,10 +1152,26 @@ where
         )
     };
 
-    render_input_order::<()>(&shell, output, previous, current, element_filter, |stage| {
-        match stage {
+    let render_order_start = Instant::now();
+    let render_order_result =
+        render_input_order::<()>(&shell, output, previous, current, element_filter, |stage| {
+        let stage_kind = match &stage {
+            Stage::ZoomUI => RenderStageKind::ZoomUi,
+            Stage::SessionLock(_) => RenderStageKind::SessionLock,
+            Stage::LayerPopup { .. } => RenderStageKind::LayerPopup,
+            Stage::LayerSurface { .. } => RenderStageKind::LayerSurface,
+            Stage::OverrideRedirect { .. } => RenderStageKind::OverrideRedirect,
+            Stage::StickyPopups(_) => RenderStageKind::StickyPopups,
+            Stage::Sticky(_) => RenderStageKind::Sticky,
+            Stage::WorkspacePopups { .. } => RenderStageKind::WorkspacePopups,
+            Stage::Workspace { .. } => RenderStageKind::Workspace,
+        };
+        let stage_start = Instant::now();
+        let elements_before = elements.len();
+        let control = match stage {
             Stage::ZoomUI => {
                 elements.extend(ZoomState::render(renderer, output));
+                ControlFlow::Continue(())
             }
             Stage::SessionLock(lock_surface) => {
                 elements.extend(
@@ -829,6 +1181,7 @@ where
                         .flat_map(crop_to_output)
                         .map(Into::into),
                 );
+                ControlFlow::Continue(())
             }
             Stage::LayerPopup {
                 popup, location, ..
@@ -849,6 +1202,7 @@ where
                     .flat_map(crop_to_output)
                     .map(Into::into),
                 );
+                ControlFlow::Continue(())
             }
             Stage::LayerSurface { layer, location } => {
                 elements.extend(
@@ -867,6 +1221,7 @@ where
                     .flat_map(crop_to_output)
                     .map(Into::into),
                 );
+                ControlFlow::Continue(())
             }
             Stage::OverrideRedirect { surface, location } => {
                 elements.extend(surface.wl_surface().into_iter().flat_map(|surface| {
@@ -885,6 +1240,7 @@ where
                     .flat_map(crop_to_output)
                     .map(Into::into)
                 }));
+                ControlFlow::Continue(())
             }
             Stage::StickyPopups(layout) => {
                 let alpha = match &overview.0 {
@@ -913,6 +1269,7 @@ where
                         .flat_map(crop_to_output)
                         .map(Into::into),
                 );
+                ControlFlow::Continue(())
             }
             Stage::Sticky(layout) => {
                 let alpha = match &overview.0 {
@@ -956,68 +1313,68 @@ where
                         .map(Into::into)
                         .flat_map(crop_to_output)
                         .map(Into::into),
-                )
+                );
+                ControlFlow::Continue(())
             }
             Stage::WorkspacePopups { workspace, offset } => {
-                elements.extend(
-                    match workspace.render_popups(
-                        renderer,
-                        last_active_seat,
-                        !move_active && is_active_space,
-                        overview.clone(),
-                        theme.cosmic(),
-                    ) {
-                        Ok(elements) => {
-                            elements
-                                .into_iter()
-                                .flat_map(crop_to_output)
-                                .map(|element| {
-                                    CosmicElement::Workspace(RelocateRenderElement::from_element(
-                                        element,
-                                        offset.to_physical_precise_round(scale),
-                                        Relocate::Relative,
-                                    ))
-                                })
-                        }
-                        Err(_) => {
-                            return ControlFlow::Break(Err(OutputNoMode));
-                        }
-                    },
-                );
+                let rendered = match workspace.render_popups(
+                    renderer,
+                    last_active_seat,
+                    !move_active && is_active_space,
+                    overview.clone(),
+                    theme.cosmic(),
+                ) {
+                    Ok(elements) => elements,
+                    Err(_) => return ControlFlow::Break(Err(OutputNoMode)),
+                };
+                elements.extend(rendered.into_iter().flat_map(crop_to_output).map(|element| {
+                    CosmicElement::Workspace(RelocateRenderElement::from_element(
+                        element,
+                        offset.to_physical_precise_round(scale),
+                        Relocate::Relative,
+                    ))
+                }));
+                ControlFlow::Continue(())
             }
             Stage::Workspace { workspace, offset } => {
-                elements.extend(
-                    match workspace.render(
-                        renderer,
-                        last_active_seat,
-                        !move_active && is_active_space,
-                        overview.clone(),
-                        resize_indicator.clone(),
-                        active_hint,
-                        theme.cosmic(),
-                    ) {
-                        Ok(elements) => {
-                            elements
-                                .into_iter()
-                                .flat_map(crop_to_output)
-                                .map(|element| {
-                                    CosmicElement::Workspace(RelocateRenderElement::from_element(
-                                        element,
-                                        offset.to_physical_precise_round(scale),
-                                        Relocate::Relative,
-                                    ))
-                                })
-                        }
-                        Err(_) => {
-                            return ControlFlow::Break(Err(OutputNoMode));
-                        }
-                    },
-                );
+                let rendered = match workspace.render(
+                    renderer,
+                    last_active_seat,
+                    !move_active && is_active_space,
+                    overview.clone(),
+                    resize_indicator.clone(),
+                    active_hint,
+                    theme.cosmic(),
+                ) {
+                    Ok(elements) => elements,
+                    Err(_) => return ControlFlow::Break(Err(OutputNoMode)),
+                };
+                elements.extend(rendered.into_iter().flat_map(crop_to_output).map(|element| {
+                    CosmicElement::Workspace(RelocateRenderElement::from_element(
+                        element,
+                        offset.to_physical_precise_round(scale),
+                        Relocate::Relative,
+                    ))
+                }));
+                ControlFlow::Continue(())
             }
         };
+        let added = elements.len().saturating_sub(elements_before);
+        render_metrics.note_stage(stage_kind, stage_start.elapsed(), added);
+        match control {
+            ControlFlow::Break(result) => ControlFlow::Break(result),
+            ControlFlow::Continue(()) => ControlFlow::Continue(()),
+        }
+    });
+    render_metrics
+        .render_input_order
+        .note(render_order_start.elapsed(), 0);
+    render_order_result?;
 
-        ControlFlow::Continue(())
-    })?;
+    note_render_perf(output, |stats| {
+        stats.note_workspace_elements(workspace_start.elapsed(), elements.len());
+        render_metrics.merge_into(stats);
+    });
 
     Ok(elements)
 }
