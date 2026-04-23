@@ -340,6 +340,7 @@ struct SurfaceLookupCounters {
     commit_schedule_from_visible: u64,
     commit_schedule_misses: u64,
     commit_schedule_visible_backoff_skips: u64,
+    commit_schedule_visible_backoff_soft_hits: u64,
     commit_layer_arrange_changed: u64,
     commit_layer_arrange_unchanged: u64,
     commit_layer_arrange_skipped_unchanged: u64,
@@ -2233,6 +2234,8 @@ impl Shell {
                 commit_schedule_misses = counters.commit_schedule_misses,
                 commit_schedule_visible_backoff_skips =
                     counters.commit_schedule_visible_backoff_skips,
+                commit_schedule_visible_backoff_soft_hits =
+                    counters.commit_schedule_visible_backoff_soft_hits,
                 commit_layer_arrange_changed = counters.commit_layer_arrange_changed,
                 commit_layer_arrange_unchanged = counters.commit_layer_arrange_unchanged,
                 commit_layer_arrange_skipped_unchanged =
@@ -2322,6 +2325,12 @@ impl Shell {
         self.note_surface_lookup_stats(|stats| stats.commit_schedule_visible_backoff_skips += 1);
     }
 
+    pub fn note_commit_schedule_visible_backoff_soft_hit(&self) {
+        self.note_surface_lookup_stats(|stats| {
+            stats.commit_schedule_visible_backoff_soft_hits += 1
+        });
+    }
+
     pub fn note_commit_layer_arrange(&self, changed: bool) {
         self.note_surface_lookup_stats(|stats| {
             if changed {
@@ -2401,7 +2410,7 @@ impl Shell {
         const BURST_LIMIT: u8 = 3;
 
         let now = Instant::now();
-        let allowed = with_surface_commit_lookup_cache(surface, |cache| {
+        let saturated = with_surface_commit_lookup_cache(surface, |cache| {
             let mut state = cache.visible_schedule.lock().unwrap();
 
             let same_output = state
@@ -2416,24 +2425,24 @@ impl Shell {
                     .is_some_and(|start| now.duration_since(start) < BURST_WINDOW)
             {
                 if state.burst_count >= BURST_LIMIT {
-                    false
+                    true
                 } else {
                     state.burst_count = state.burst_count.saturating_add(1);
-                    true
+                    false
                 }
             } else {
                 state.output = Some(output.downgrade());
                 state.window_start = Some(now);
                 state.burst_count = 1;
-                true
+                false
             }
         });
 
-        if !allowed {
-            self.note_commit_schedule_visible_backoff_skip();
+        if saturated {
+            self.note_commit_schedule_visible_backoff_soft_hit();
         }
 
-        allowed
+        true
     }
 
     fn allow_surface_lookup_fallback(
