@@ -47,6 +47,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     sync::{Arc, RwLock, atomic::AtomicBool},
+    time::{Duration, Instant},
 };
 
 mod device;
@@ -104,6 +105,29 @@ pub struct KmsState {
     libinput: Libinput,
 
     pub syncobj_state: Option<DrmSyncobjState>,
+    input_redraw_last: HashMap<Output, Instant>,
+    input_redraw_stats: InputRedrawStats,
+}
+
+#[derive(Debug)]
+struct InputRedrawStats {
+    last_log: Instant,
+    input_events: u64,
+    outputs_considered: u64,
+    schedule_dispatched: u64,
+    schedule_throttled: u64,
+}
+
+impl Default for InputRedrawStats {
+    fn default() -> Self {
+        Self {
+            last_log: Instant::now(),
+            input_events: 0,
+            outputs_considered: 0,
+            schedule_dispatched: 0,
+            schedule_throttled: 0,
+        }
+    }
 }
 
 pub struct KmsGuard<'a> {
@@ -161,6 +185,8 @@ pub fn init_backend(
         libinput: libinput_context,
 
         syncobj_state: None,
+        input_redraw_last: HashMap::new(),
+        input_redraw_stats: InputRedrawStats::default(),
     });
 
     // manually add already present gpus
@@ -233,6 +259,7 @@ fn init_libinput(
         } else if let InputEvent::DeviceRemoved { device } = &event {
             state.backend.kms().input_devices.remove(device.name());
         }
+        state.backend.kms().note_input_render_event();
 
         let mut outputs = {
             let shell = state.common.shell.read();
@@ -253,7 +280,7 @@ fn init_libinput(
         }
 
         for output in outputs {
-            state.backend.kms().schedule_render(&output);
+            state.backend.kms().schedule_render_from_input(&output);
         }
     })
     .map_err(|err| err.error)
@@ -481,6 +508,52 @@ impl State {
 }
 
 impl KmsState {
+    fn note_input_render_event(&mut self) {
+        self.input_redraw_stats.input_events += 1;
+        self.maybe_log_input_redraw_stats();
+    }
+
+    fn schedule_render_from_input(&mut self, output: &Output) {
+        const INPUT_REDRAW_MIN_INTERVAL: Duration = Duration::from_millis(8);
+
+        self.input_redraw_stats.outputs_considered += 1;
+
+        let now = Instant::now();
+        if self
+            .input_redraw_last
+            .get(output)
+            .is_some_and(|last| now.duration_since(*last) < INPUT_REDRAW_MIN_INTERVAL)
+        {
+            self.input_redraw_stats.schedule_throttled += 1;
+            self.maybe_log_input_redraw_stats();
+            return;
+        }
+
+        self.input_redraw_last.insert(output.clone(), now);
+        self.input_redraw_stats.schedule_dispatched += 1;
+        self.schedule_render(output);
+        self.maybe_log_input_redraw_stats();
+    }
+
+    fn maybe_log_input_redraw_stats(&mut self) {
+        if self.input_redraw_stats.last_log.elapsed() < Duration::from_secs(60) {
+            return;
+        }
+
+        warn!(
+            input_events = self.input_redraw_stats.input_events,
+            input_outputs_considered = self.input_redraw_stats.outputs_considered,
+            input_schedule_dispatched = self.input_redraw_stats.schedule_dispatched,
+            input_schedule_throttled = self.input_redraw_stats.schedule_throttled,
+            "[perf] kms input render stats"
+        );
+
+        self.input_redraw_stats = InputRedrawStats {
+            last_log: Instant::now(),
+            ..InputRedrawStats::default()
+        };
+    }
+
     fn select_primary_gpu(&mut self, dh: &DisplayHandle) -> Result<()> {
         // We don't have to check the allow/blocklist here,
         // as any disallowed devices won't be in `self.drm_devices`.
