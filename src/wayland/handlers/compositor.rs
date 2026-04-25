@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::{shell::grabs::SeatMoveGrabState, state::ClientState, utils::prelude::*};
+use crate::{
+    shell::{CommitOutcome, CommitScheduleDecision, grabs::SeatMoveGrabState},
+    state::ClientState,
+    utils::prelude::*,
+};
 use calloop::Interest;
 use smithay::{
     backend::renderer::{
@@ -29,7 +33,7 @@ use smithay::{
     },
     xwayland::XWaylandClientData,
 };
-use std::{collections::VecDeque, sync::Mutex, time::Duration};
+use std::{collections::VecDeque, sync::Mutex, time::{Duration, Instant}};
 
 fn toplevel_ensure_initial_configure(
     toplevel: &ToplevelSurface,
@@ -69,6 +73,13 @@ fn xdg_popup_ensure_initial_configure(popup: &PopupKind) {
             popup.send_configure().expect("initial configure failed");
         }
     }
+}
+
+fn surface_client_pid(surface: &WlSurface, dh: &smithay::reexports::wayland_server::DisplayHandle) -> Option<i32> {
+    surface
+        .client()
+        .and_then(|client| client.get_credentials(dh).ok())
+        .map(|credentials| credentials.pid)
 }
 
 fn layer_surface_check_inital_configure(surface: &LayerSurface) -> bool {
@@ -259,6 +270,10 @@ impl CompositorHandler for State {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        let commit_start = Instant::now();
+        let commit_pid = surface_client_pid(surface, &self.common.display_handle);
+        let surface_id = surface.id();
+
         // first load the buffer for various smithay helper functions (which also initializes the RendererSurfaceState)
         on_commit_buffer_handler::<Self>(surface);
 
@@ -279,30 +294,53 @@ impl CompositorHandler for State {
         };
 
         // schedule a new render
-        let should_schedule_visible = visible_output
+        let visible_schedule_decision = visible_output
             .as_ref()
-            .is_some_and(|output| shell.should_schedule_visible_commit(surface, output));
+            .map(|output| shell.visible_commit_schedule_decision(surface, output, commit_pid));
+        let schedule_decision = if layer_output.is_some() {
+            CommitScheduleDecision::Layer
+        } else {
+            visible_schedule_decision.unwrap_or(CommitScheduleDecision::Miss)
+        };
 
         if let Some(output) = layer_output
             .as_ref()
-            .or(should_schedule_visible.then_some(visible_output.as_ref()).flatten())
+            .or(matches!(schedule_decision, CommitScheduleDecision::Visible)
+                .then_some(visible_output.as_ref())
+                .flatten())
         {
             self.backend.schedule_render(output);
         }
-        shell.note_commit_schedule_source(layer_output.is_some(), should_schedule_visible);
+        shell.note_commit_schedule_decision(schedule_decision);
 
         if mapped {
             shell.note_commit_mapped_short_circuit();
+            shell.note_commit_attribution(
+                commit_pid,
+                surface_id,
+                schedule_decision,
+                CommitOutcome::Mapped,
+                commit_start.elapsed(),
+            );
             return;
         }
 
         if let Some(popup) = self.common.popups.find_popup(surface) {
             shell.note_commit_popup_short_circuit();
             xdg_popup_ensure_initial_configure(&popup);
+            shell.note_commit_attribution(
+                commit_pid,
+                surface_id,
+                schedule_decision,
+                CommitOutcome::Popup,
+                commit_start.elapsed(),
+            );
             return;
         }
 
+        let mut commit_outcome = CommitOutcome::Regular;
         if with_renderer_surface_state(surface, |state| state.buffer().is_none()).unwrap_or(false) {
+            commit_outcome = CommitOutcome::NullBuffer;
             shell.note_commit_null_buffer();
             // handle null-commits causing weird conflicts:
 
@@ -341,6 +379,13 @@ impl CompositorHandler for State {
                         stack.remove_idx(i);
                     }
                 } else {
+                    shell.note_commit_attribution(
+                        commit_pid,
+                        surface_id,
+                        schedule_decision,
+                        commit_outcome,
+                        commit_start.elapsed(),
+                    );
                     std::mem::drop(shell);
                     seat.get_pointer()
                         .unwrap()
@@ -386,6 +431,14 @@ impl CompositorHandler for State {
                 }
             }
         }
+
+        shell.note_commit_attribution(
+            commit_pid,
+            surface_id,
+            schedule_decision,
+            commit_outcome,
+            commit_start.elapsed(),
+        );
     }
 }
 

@@ -2,7 +2,7 @@
 
 use crate::{
     config::{CompOutputConfig, ScreenFilter},
-    shell::{SeatExt, Shell},
+    shell::{OverloadLevel, SeatExt, Shell},
     state::BackendData,
     utils::{env::dev_var, prelude::*},
 };
@@ -158,6 +158,9 @@ struct InputRedrawStats {
     input_events: u64,
     pointer_motion_events: u64,
     broad_events: u64,
+    overload_normal_events: u64,
+    overload_soft_events: u64,
+    overload_hard_events: u64,
     outputs_considered: u64,
     pointer_motion_outputs_considered: u64,
     broad_outputs_considered: u64,
@@ -176,6 +179,9 @@ impl Default for InputRedrawStats {
             input_events: 0,
             pointer_motion_events: 0,
             broad_events: 0,
+            overload_normal_events: 0,
+            overload_soft_events: 0,
+            overload_hard_events: 0,
             outputs_considered: 0,
             pointer_motion_outputs_considered: 0,
             broad_outputs_considered: 0,
@@ -319,19 +325,29 @@ fn init_libinput(
             state.backend.kms().input_devices.remove(device.name());
         }
         let redraw_scope = input_redraw_scope(&event);
-        state.backend.kms().note_input_render_event(redraw_scope);
 
-        let mut outputs = {
+        let (mut outputs, mut overload_level) = {
             let shell = state.common.shell.read();
-            collect_redraw_outputs_for_scope(&shell, redraw_scope)
+            (
+                collect_redraw_outputs_for_scope(&shell, redraw_scope),
+                shell.overload_level(),
+            )
         };
+        state
+            .backend
+            .kms()
+            .note_input_render_event(redraw_scope, overload_level);
 
         state.process_input_event(event);
 
-        let additional_outputs = {
+        let (additional_outputs, after_overload_level) = {
             let shell = state.common.shell.read();
-            collect_redraw_outputs_for_scope(&shell, redraw_scope)
+            (
+                collect_redraw_outputs_for_scope(&shell, redraw_scope),
+                shell.overload_level(),
+            )
         };
+        overload_level = overload_level.max(after_overload_level);
 
         for output in additional_outputs {
             if !outputs.iter().any(|existing| *existing == output) {
@@ -343,7 +359,7 @@ fn init_libinput(
             state
                 .backend
                 .kms()
-                .schedule_render_from_input(&output, redraw_scope);
+                .schedule_render_from_input(&output, redraw_scope, overload_level);
         }
     })
     .map_err(|err| err.error)
@@ -571,7 +587,7 @@ impl State {
 }
 
 impl KmsState {
-    fn note_input_render_event(&mut self, scope: InputRedrawScope) {
+    fn note_input_render_event(&mut self, scope: InputRedrawScope, overload_level: OverloadLevel) {
         self.input_redraw_stats.input_events += 1;
         match scope {
             InputRedrawScope::PointerMotion => {
@@ -581,11 +597,26 @@ impl KmsState {
                 self.input_redraw_stats.broad_events += 1;
             }
         }
+        match overload_level {
+            OverloadLevel::Normal => self.input_redraw_stats.overload_normal_events += 1,
+            OverloadLevel::Soft => self.input_redraw_stats.overload_soft_events += 1,
+            OverloadLevel::Hard => self.input_redraw_stats.overload_hard_events += 1,
+        }
         self.maybe_log_input_redraw_stats();
     }
 
-    fn schedule_render_from_input(&mut self, output: &Output, scope: InputRedrawScope) {
-        const INPUT_REDRAW_MIN_INTERVAL: Duration = Duration::from_millis(8);
+    fn schedule_render_from_input(
+        &mut self,
+        output: &Output,
+        scope: InputRedrawScope,
+        overload_level: OverloadLevel,
+    ) {
+        let min_interval = match (scope, overload_level) {
+            (InputRedrawScope::PointerMotion, OverloadLevel::Normal) => Duration::from_millis(8),
+            (InputRedrawScope::PointerMotion, OverloadLevel::Soft) => Duration::from_millis(12),
+            (InputRedrawScope::PointerMotion, OverloadLevel::Hard) => Duration::from_millis(16),
+            (InputRedrawScope::Broad, _) => Duration::from_millis(8),
+        };
 
         self.input_redraw_stats.outputs_considered += 1;
         match scope {
@@ -601,7 +632,7 @@ impl KmsState {
         if self
             .input_redraw_last
             .get(output)
-            .is_some_and(|last| now.duration_since(*last) < INPUT_REDRAW_MIN_INTERVAL)
+            .is_some_and(|last| now.duration_since(*last) < min_interval)
         {
             self.input_redraw_stats.schedule_throttled += 1;
             match scope {
@@ -639,6 +670,9 @@ impl KmsState {
             input_events = self.input_redraw_stats.input_events,
             input_pointer_motion_events = self.input_redraw_stats.pointer_motion_events,
             input_broad_events = self.input_redraw_stats.broad_events,
+            input_overload_normal_events = self.input_redraw_stats.overload_normal_events,
+            input_overload_soft_events = self.input_redraw_stats.overload_soft_events,
+            input_overload_hard_events = self.input_redraw_stats.overload_hard_events,
             input_outputs_considered = self.input_redraw_stats.outputs_considered,
             input_pointer_motion_outputs_considered =
                 self.input_redraw_stats.pointer_motion_outputs_considered,
