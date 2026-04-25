@@ -17,7 +17,7 @@ use smithay::{
         allocator::{Buffer, dmabuf::Dmabuf, format::FormatSet},
         drm::{DrmDeviceFd, DrmNode, NodeType, VrrSupport, output::DrmOutputRenderElements},
         egl::{EGLContext, EGLDevice, EGLDisplay},
-        input::InputEvent,
+        input::{InputBackend, InputEvent},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{glow::GlowRenderer, multigpu::GpuManager},
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
@@ -92,6 +92,49 @@ fn collect_input_redraw_outputs(shell: &Shell) -> Vec<Output> {
     outputs
 }
 
+fn collect_pointer_redraw_outputs(shell: &Shell) -> Vec<Output> {
+    let mut outputs = Vec::new();
+
+    for seat in shell.seats.iter() {
+        if let Some(pointer) = seat.get_pointer() {
+            let pointer_location = pointer.current_location().as_global();
+            if let Some(output) = shell
+                .outputs()
+                .find(|output| output.geometry().to_f64().contains(pointer_location))
+                .cloned()
+            {
+                if !outputs.iter().any(|existing| *existing == output) {
+                    outputs.push(output);
+                }
+            }
+        }
+    }
+
+    outputs
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InputRedrawScope {
+    PointerMotion,
+    Broad,
+}
+
+fn input_redraw_scope<B: InputBackend>(event: &InputEvent<B>) -> InputRedrawScope {
+    match event {
+        InputEvent::PointerMotion { .. } | InputEvent::PointerMotionAbsolute { .. } => {
+            InputRedrawScope::PointerMotion
+        }
+        _ => InputRedrawScope::Broad,
+    }
+}
+
+fn collect_redraw_outputs_for_scope(shell: &Shell, scope: InputRedrawScope) -> Vec<Output> {
+    match scope {
+        InputRedrawScope::PointerMotion => collect_pointer_redraw_outputs(shell),
+        InputRedrawScope::Broad => collect_input_redraw_outputs(shell),
+    }
+}
+
 #[derive(Debug)]
 pub struct KmsState {
     pub drm_devices: IndexMap<DrmNode, Device>,
@@ -113,9 +156,17 @@ pub struct KmsState {
 struct InputRedrawStats {
     last_log: Instant,
     input_events: u64,
+    pointer_motion_events: u64,
+    broad_events: u64,
     outputs_considered: u64,
+    pointer_motion_outputs_considered: u64,
+    broad_outputs_considered: u64,
     schedule_dispatched: u64,
+    pointer_motion_schedule_dispatched: u64,
+    broad_schedule_dispatched: u64,
     schedule_throttled: u64,
+    pointer_motion_schedule_throttled: u64,
+    broad_schedule_throttled: u64,
 }
 
 impl Default for InputRedrawStats {
@@ -123,9 +174,17 @@ impl Default for InputRedrawStats {
         Self {
             last_log: Instant::now(),
             input_events: 0,
+            pointer_motion_events: 0,
+            broad_events: 0,
             outputs_considered: 0,
+            pointer_motion_outputs_considered: 0,
+            broad_outputs_considered: 0,
             schedule_dispatched: 0,
+            pointer_motion_schedule_dispatched: 0,
+            broad_schedule_dispatched: 0,
             schedule_throttled: 0,
+            pointer_motion_schedule_throttled: 0,
+            broad_schedule_throttled: 0,
         }
     }
 }
@@ -259,18 +318,19 @@ fn init_libinput(
         } else if let InputEvent::DeviceRemoved { device } = &event {
             state.backend.kms().input_devices.remove(device.name());
         }
-        state.backend.kms().note_input_render_event();
+        let redraw_scope = input_redraw_scope(&event);
+        state.backend.kms().note_input_render_event(redraw_scope);
 
         let mut outputs = {
             let shell = state.common.shell.read();
-            collect_input_redraw_outputs(&shell)
+            collect_redraw_outputs_for_scope(&shell, redraw_scope)
         };
 
         state.process_input_event(event);
 
         let additional_outputs = {
             let shell = state.common.shell.read();
-            collect_input_redraw_outputs(&shell)
+            collect_redraw_outputs_for_scope(&shell, redraw_scope)
         };
 
         for output in additional_outputs {
@@ -280,7 +340,10 @@ fn init_libinput(
         }
 
         for output in outputs {
-            state.backend.kms().schedule_render_from_input(&output);
+            state
+                .backend
+                .kms()
+                .schedule_render_from_input(&output, redraw_scope);
         }
     })
     .map_err(|err| err.error)
@@ -508,15 +571,31 @@ impl State {
 }
 
 impl KmsState {
-    fn note_input_render_event(&mut self) {
+    fn note_input_render_event(&mut self, scope: InputRedrawScope) {
         self.input_redraw_stats.input_events += 1;
+        match scope {
+            InputRedrawScope::PointerMotion => {
+                self.input_redraw_stats.pointer_motion_events += 1;
+            }
+            InputRedrawScope::Broad => {
+                self.input_redraw_stats.broad_events += 1;
+            }
+        }
         self.maybe_log_input_redraw_stats();
     }
 
-    fn schedule_render_from_input(&mut self, output: &Output) {
+    fn schedule_render_from_input(&mut self, output: &Output, scope: InputRedrawScope) {
         const INPUT_REDRAW_MIN_INTERVAL: Duration = Duration::from_millis(8);
 
         self.input_redraw_stats.outputs_considered += 1;
+        match scope {
+            InputRedrawScope::PointerMotion => {
+                self.input_redraw_stats.pointer_motion_outputs_considered += 1;
+            }
+            InputRedrawScope::Broad => {
+                self.input_redraw_stats.broad_outputs_considered += 1;
+            }
+        }
 
         let now = Instant::now();
         if self
@@ -525,12 +604,28 @@ impl KmsState {
             .is_some_and(|last| now.duration_since(*last) < INPUT_REDRAW_MIN_INTERVAL)
         {
             self.input_redraw_stats.schedule_throttled += 1;
+            match scope {
+                InputRedrawScope::PointerMotion => {
+                    self.input_redraw_stats.pointer_motion_schedule_throttled += 1;
+                }
+                InputRedrawScope::Broad => {
+                    self.input_redraw_stats.broad_schedule_throttled += 1;
+                }
+            }
             self.maybe_log_input_redraw_stats();
             return;
         }
 
         self.input_redraw_last.insert(output.clone(), now);
         self.input_redraw_stats.schedule_dispatched += 1;
+        match scope {
+            InputRedrawScope::PointerMotion => {
+                self.input_redraw_stats.pointer_motion_schedule_dispatched += 1;
+            }
+            InputRedrawScope::Broad => {
+                self.input_redraw_stats.broad_schedule_dispatched += 1;
+            }
+        }
         self.schedule_render(output);
         self.maybe_log_input_redraw_stats();
     }
@@ -542,9 +637,20 @@ impl KmsState {
 
         warn!(
             input_events = self.input_redraw_stats.input_events,
+            input_pointer_motion_events = self.input_redraw_stats.pointer_motion_events,
+            input_broad_events = self.input_redraw_stats.broad_events,
             input_outputs_considered = self.input_redraw_stats.outputs_considered,
+            input_pointer_motion_outputs_considered =
+                self.input_redraw_stats.pointer_motion_outputs_considered,
+            input_broad_outputs_considered = self.input_redraw_stats.broad_outputs_considered,
             input_schedule_dispatched = self.input_redraw_stats.schedule_dispatched,
+            input_pointer_motion_schedule_dispatched =
+                self.input_redraw_stats.pointer_motion_schedule_dispatched,
+            input_broad_schedule_dispatched = self.input_redraw_stats.broad_schedule_dispatched,
             input_schedule_throttled = self.input_redraw_stats.schedule_throttled,
+            input_pointer_motion_schedule_throttled =
+                self.input_redraw_stats.pointer_motion_schedule_throttled,
+            input_broad_schedule_throttled = self.input_redraw_stats.broad_schedule_throttled,
             "[perf] kms input render stats"
         );
 
