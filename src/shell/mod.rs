@@ -300,6 +300,9 @@ impl OverloadTracker {
         }
 
         let commits = self.commits;
+        let visible_schedules = self.visible_schedules;
+        let layer_schedules = self.layer_schedules;
+        let visible_budget_skips = self.visible_budget_skips;
         let visible_pressure = self.visible_schedules + self.visible_budget_skips;
         let avg_commit_us = if commits == 0 {
             0
@@ -308,10 +311,18 @@ impl OverloadTracker {
         };
         let max_commit_us = self.commit_us_max;
 
-        let hard_signal =
-            commits >= 180 || visible_pressure >= 140 || avg_commit_us >= 2500 || max_commit_us >= 12000;
-        let soft_signal =
-            hard_signal || commits >= 90 || visible_pressure >= 70 || avg_commit_us >= 1200 || max_commit_us >= 7000;
+        let severe_hard_signal =
+            commits >= 140 || visible_pressure >= 80 || avg_commit_us >= 2200 || max_commit_us >= 10000;
+        let hard_signal = severe_hard_signal
+            || commits >= 110
+            || visible_pressure >= 65
+            || avg_commit_us >= 1800
+            || max_commit_us >= 8000;
+        let soft_signal = hard_signal
+            || commits >= 65
+            || visible_pressure >= 45
+            || avg_commit_us >= 800
+            || max_commit_us >= 4000;
 
         if hard_signal {
             self.consecutive_hard_windows = self.consecutive_hard_windows.saturating_add(1);
@@ -328,11 +339,17 @@ impl OverloadTracker {
         }
 
         let old_level = self.level;
-        let new_level = if self.consecutive_hard_windows >= 2 {
+        let new_level = if severe_hard_signal
+            || self.consecutive_hard_windows >= 2
+            || (self.level == OverloadLevel::Hard && hard_signal)
+        {
             OverloadLevel::Hard
-        } else if hard_signal || self.consecutive_soft_windows >= 2 {
+        } else if hard_signal
+            || soft_signal
+            || (self.level == OverloadLevel::Soft && self.consecutive_normal_windows < 10)
+        {
             OverloadLevel::Soft
-        } else if self.consecutive_normal_windows >= 3 {
+        } else if self.consecutive_normal_windows >= 10 {
             OverloadLevel::Normal
         } else {
             self.level
@@ -351,11 +368,17 @@ impl OverloadTracker {
             old_level,
             new_level,
             commits,
+            visible_schedules,
+            layer_schedules,
+            visible_budget_skips,
             visible_pressure,
             avg_commit_us,
             max_commit_us,
             hard_signal,
             soft_signal,
+            consecutive_soft_windows: self.consecutive_soft_windows,
+            consecutive_hard_windows: self.consecutive_hard_windows,
+            consecutive_normal_windows: self.consecutive_normal_windows,
         })
     }
 }
@@ -365,11 +388,17 @@ struct OverloadTransition {
     old_level: OverloadLevel,
     new_level: OverloadLevel,
     commits: u64,
+    visible_schedules: u64,
+    layer_schedules: u64,
+    visible_budget_skips: u64,
     visible_pressure: u64,
     avg_commit_us: u64,
     max_commit_us: u64,
     hard_signal: bool,
     soft_signal: bool,
+    consecutive_soft_windows: u8,
+    consecutive_hard_windows: u8,
+    consecutive_normal_windows: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2726,11 +2755,17 @@ impl Shell {
                 old_level = ?transition.old_level,
                 new_level = ?transition.new_level,
                 commits_per_sec = transition.commits,
+                visible_schedules_per_sec = transition.visible_schedules,
+                layer_schedules_per_sec = transition.layer_schedules,
+                visible_budget_skips_per_sec = transition.visible_budget_skips,
                 visible_pressure_per_sec = transition.visible_pressure,
                 avg_commit_us = transition.avg_commit_us,
                 max_commit_us = transition.max_commit_us,
                 hard_signal = transition.hard_signal,
                 soft_signal = transition.soft_signal,
+                consecutive_soft_windows = transition.consecutive_soft_windows,
+                consecutive_hard_windows = transition.consecutive_hard_windows,
+                consecutive_normal_windows = transition.consecutive_normal_windows,
                 "[perf] compositor overload transition"
             );
         }
@@ -2748,7 +2783,7 @@ impl Shell {
 
         let limit = match level {
             OverloadLevel::Normal => return true,
-            OverloadLevel::Soft => 90,
+            OverloadLevel::Soft => 75,
             OverloadLevel::Hard => 60,
         };
 
@@ -2822,8 +2857,8 @@ impl Shell {
     ) -> CommitScheduleDecision {
         const BURST_WINDOW: Duration = Duration::from_millis(8);
         const BURST_LIMIT: u8 = 3;
-        const SOFT_OVERLOAD_MIN_INTERVAL: Duration = Duration::from_millis(12);
-        const HARD_OVERLOAD_MIN_INTERVAL: Duration = Duration::from_millis(16);
+        const SOFT_OVERLOAD_MIN_INTERVAL: Duration = Duration::from_millis(24);
+        const HARD_OVERLOAD_MIN_INTERVAL: Duration = Duration::from_millis(33);
 
         let now = Instant::now();
         let overload_level = self.overload_level();
@@ -2868,7 +2903,17 @@ impl Shell {
             self.note_commit_schedule_visible_backoff_soft_hit();
         }
 
-        if overload_level != OverloadLevel::Normal && saturated && !overdue {
+        let interval_limited = overload_level != OverloadLevel::Normal
+            && with_surface_commit_lookup_cache(surface, |cache| {
+                cache
+                    .visible_schedule
+                    .lock()
+                    .unwrap()
+                    .last_allowed
+                    .is_some_and(|last| now.duration_since(last) < min_interval)
+            });
+
+        if interval_limited || (overload_level != OverloadLevel::Normal && saturated && !overdue) {
             with_surface_commit_lookup_cache(surface, |cache| {
                 cache
                     .visible_schedule
