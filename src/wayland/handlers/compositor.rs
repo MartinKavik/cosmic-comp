@@ -37,7 +37,11 @@ use smithay::{
     },
     xwayland::XWaylandClientData,
 };
-use std::{collections::VecDeque, sync::Mutex, time::{Duration, Instant}};
+use std::{
+    collections::VecDeque,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 use tracing::warn;
 
 fn schedule_deferred_output_render(
@@ -98,7 +102,10 @@ fn xdg_popup_ensure_initial_configure(popup: &PopupKind) {
     }
 }
 
-fn surface_client_pid(surface: &WlSurface, dh: &smithay::reexports::wayland_server::DisplayHandle) -> Option<i32> {
+fn surface_client_pid(
+    surface: &WlSurface,
+    dh: &smithay::reexports::wayland_server::DisplayHandle,
+) -> Option<i32> {
     surface
         .client()
         .and_then(|client| client.get_credentials(dh).ok())
@@ -343,10 +350,9 @@ impl CompositorHandler for State {
             .as_ref()
             .filter(|output| shell.should_schedule_layer_commit_render(surface, output));
         if let Some(output) =
-            layer_schedule_output
-                .or(matches!(schedule_decision, CommitScheduleDecision::Visible)
-                    .then_some(visible_output.as_ref())
-                    .flatten())
+            layer_schedule_output.or(matches!(schedule_decision, CommitScheduleDecision::Visible)
+                .then_some(visible_output.as_ref())
+                .flatten())
         {
             self.backend.schedule_render(output);
         }
@@ -453,8 +459,7 @@ impl CompositorHandler for State {
                 if let Some(element) = shell.resizing_element_for_surface(surface).cloned() {
                     shell.note_commit_resize_lookup(true);
                     crate::shell::layout::floating::ResizeSurfaceGrab::apply_resize_to_location(
-                        element,
-                        &mut shell,
+                        element, &mut shell,
                     );
                 } else {
                     shell.note_commit_resize_lookup(false);

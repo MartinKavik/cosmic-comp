@@ -97,8 +97,8 @@ use std::{
         mpsc::{Receiver, SyncSender},
     },
     thread::JoinHandle,
-    time::Instant,
     time::Duration,
+    time::Instant,
 };
 
 mod timings;
@@ -444,10 +444,9 @@ impl Surface {
                 .pending_since_ms
                 .load(Ordering::Relaxed);
             if pending_since_ms != 0 {
-                self.schedule_metrics.schedule_pending_age_ms_max.fetch_max(
-                    now_ms.saturating_sub(pending_since_ms),
-                    Ordering::Relaxed,
-                );
+                self.schedule_metrics
+                    .schedule_pending_age_ms_max
+                    .fetch_max(now_ms.saturating_sub(pending_since_ms), Ordering::Relaxed);
             }
             self.schedule_metrics
                 .schedule_suppressed_pending
@@ -463,7 +462,11 @@ impl Surface {
             .schedule_dispatched
             .fetch_add(1, Ordering::Relaxed);
 
-        if self.thread_command.send(ThreadCommand::ScheduleRender).is_err() {
+        if self
+            .thread_command
+            .send(ThreadCommand::ScheduleRender)
+            .is_err()
+        {
             self.render_request_pending.store(false, Ordering::Release);
             self.schedule_metrics
                 .pending_since_ms

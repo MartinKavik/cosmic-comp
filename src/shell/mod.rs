@@ -91,7 +91,9 @@ pub mod layout;
 mod seats;
 mod workspace;
 pub mod zoom;
-pub use self::element::{CosmicMapped, CosmicMappedRenderElement, CosmicSurface, WeakCosmicSurface};
+pub use self::element::{
+    CosmicMapped, CosmicMappedRenderElement, CosmicSurface, WeakCosmicSurface,
+};
 pub use self::seats::*;
 pub use self::workspace::*;
 use self::zoom::{OutputZoomState, ZoomState};
@@ -649,10 +651,9 @@ impl std::fmt::Debug for SurfaceIndexRole {
             SurfaceIndexRole::Cursor { output } => {
                 f.debug_struct("Cursor").field("output", output).finish()
             }
-            SurfaceIndexRole::MoveGrab { output } => f
-                .debug_struct("MoveGrab")
-                .field("output", output)
-                .finish(),
+            SurfaceIndexRole::MoveGrab { output } => {
+                f.debug_struct("MoveGrab").field("output", output).finish()
+            }
             SurfaceIndexRole::DndIcon { output } => {
                 f.debug_struct("DndIcon").field("output", output).finish()
             }
@@ -979,7 +980,8 @@ pub struct Shell {
     commit_attribution_stats: Mutex<CommitAttributionStats>,
     overload_tracker: Mutex<OverloadTracker>,
     client_visible_budgets: Mutex<HashMap<i32, ClientVisibleBudgetState>>,
-    client_output_visible_budgets: Mutex<HashMap<ClientOutputBudgetKey, ClientOutputVisibleBudgetState>>,
+    client_output_visible_budgets:
+        Mutex<HashMap<ClientOutputBudgetKey, ClientOutputVisibleBudgetState>>,
 
     theme: cosmic::Theme,
     pub active_hint: bool,
@@ -2274,8 +2276,7 @@ impl Common {
                 .surface_index_role(surface)
                 .map(|role| role.is_mapped_window_role())
                 .unwrap_or(true);
-            if should_lookup_mapped
-                && let Some(mapped) = shell.cached_element_for_surface(surface)
+            if should_lookup_mapped && let Some(mapped) = shell.cached_element_for_surface(surface)
             {
                 mapped.on_commit(surface);
             }
@@ -2659,12 +2660,10 @@ impl Shell {
                     counters.commit_schedule_visible_backoff_skips,
                 commit_schedule_visible_backoff_soft_hits =
                     counters.commit_schedule_visible_backoff_soft_hits,
-                commit_schedule_client_budget_skips =
-                    counters.commit_schedule_client_budget_skips,
+                commit_schedule_client_budget_skips = counters.commit_schedule_client_budget_skips,
                 commit_schedule_client_output_budget_skips =
                     counters.commit_schedule_client_output_budget_skips,
-                commit_schedule_layer_render_skips =
-                    counters.commit_schedule_layer_render_skips,
+                commit_schedule_layer_render_skips = counters.commit_schedule_layer_render_skips,
                 commit_schedule_deferred_visible_renders =
                     counters.commit_schedule_deferred_visible_renders,
                 commit_schedule_deferred_visible_render_coalesced =
@@ -2704,8 +2703,7 @@ impl Shell {
                 index_rebuild_us_total = counters.index_rebuild_us_total,
                 index_rebuild_us_max = counters.index_rebuild_us_max,
                 layer_arrange_backoff_activations = counters.layer_arrange_backoff_activations,
-                lookup_fallback_backoff_activations =
-                    counters.lookup_fallback_backoff_activations,
+                lookup_fallback_backoff_activations = counters.lookup_fallback_backoff_activations,
                 lookup_fallback_backoff_skips = counters.lookup_fallback_backoff_skips,
                 "[perf] surface lookup cache stats"
             );
@@ -2743,15 +2741,13 @@ impl Shell {
     }
 
     pub fn note_commit_schedule_decision(&self, decision: CommitScheduleDecision) {
-        self.note_surface_lookup_stats(|stats| {
-            match decision {
-                CommitScheduleDecision::Layer => stats.commit_schedule_from_layer += 1,
-                CommitScheduleDecision::Visible => stats.commit_schedule_from_visible += 1,
-                CommitScheduleDecision::VisibleBudgetSkipped => {
-                    stats.commit_schedule_visible_backoff_skips += 1;
-                }
-                CommitScheduleDecision::Miss => stats.commit_schedule_misses += 1,
+        self.note_surface_lookup_stats(|stats| match decision {
+            CommitScheduleDecision::Layer => stats.commit_schedule_from_layer += 1,
+            CommitScheduleDecision::Visible => stats.commit_schedule_from_visible += 1,
+            CommitScheduleDecision::VisibleBudgetSkipped => {
+                stats.commit_schedule_visible_backoff_skips += 1;
             }
+            CommitScheduleDecision::Miss => stats.commit_schedule_misses += 1,
         });
     }
 
@@ -2780,9 +2776,7 @@ impl Shell {
     }
 
     fn note_commit_schedule_deferred_visible_render(&self) {
-        self.note_surface_lookup_stats(|stats| {
-            stats.commit_schedule_deferred_visible_renders += 1
-        });
+        self.note_surface_lookup_stats(|stats| stats.commit_schedule_deferred_visible_renders += 1);
     }
 
     fn note_commit_schedule_deferred_visible_render_coalesced(&self) {
@@ -3008,9 +3002,9 @@ impl Shell {
         let mut budgets = self.client_visible_budgets.lock().unwrap();
         if budgets.len() > 256 {
             budgets.retain(|_, budget| {
-                budget
-                    .last_seen
-                    .is_some_and(|last_seen| now.duration_since(last_seen) < Duration::from_secs(300))
+                budget.last_seen.is_some_and(|last_seen| {
+                    now.duration_since(last_seen) < Duration::from_secs(300)
+                })
             });
         }
         let budget = budgets.entry(pid).or_default();
@@ -3052,9 +3046,9 @@ impl Shell {
         let mut budgets = self.client_output_visible_budgets.lock().unwrap();
         if budgets.len() > 512 {
             budgets.retain(|_, budget| {
-                budget
-                    .last_seen
-                    .is_some_and(|last_seen| now.duration_since(last_seen) < Duration::from_secs(300))
+                budget.last_seen.is_some_and(|last_seen| {
+                    now.duration_since(last_seen) < Duration::from_secs(300)
+                })
             });
         }
 
@@ -3179,11 +3173,7 @@ impl Shell {
 
         if interval_limited || (overload_level != OverloadLevel::Normal && saturated && !overdue) {
             with_surface_commit_lookup_cache(surface, |cache| {
-                cache
-                    .visible_schedule
-                    .lock()
-                    .unwrap()
-                    .skipped_since_allowed += 1;
+                cache.visible_schedule.lock().unwrap().skipped_since_allowed += 1;
             });
             return CommitScheduleDecision::VisibleBudgetSkipped;
         }
@@ -3199,11 +3189,7 @@ impl Shell {
 
         if !self.allow_client_output_visible_schedule(pid, output, overload_level, now) {
             with_surface_commit_lookup_cache(surface, |cache| {
-                cache
-                    .visible_schedule
-                    .lock()
-                    .unwrap()
-                    .skipped_since_allowed += 1;
+                cache.visible_schedule.lock().unwrap().skipped_since_allowed += 1;
             });
             return CommitScheduleDecision::VisibleBudgetSkipped;
         }
@@ -3212,11 +3198,7 @@ impl Shell {
         if !force_surface_liveness && !self.allow_client_visible_schedule(pid, overload_level, now)
         {
             with_surface_commit_lookup_cache(surface, |cache| {
-                cache
-                    .visible_schedule
-                    .lock()
-                    .unwrap()
-                    .skipped_since_allowed += 1;
+                cache.visible_schedule.lock().unwrap().skipped_since_allowed += 1;
             });
             return CommitScheduleDecision::VisibleBudgetSkipped;
         }
@@ -3229,11 +3211,7 @@ impl Shell {
         CommitScheduleDecision::Visible
     }
 
-    fn allow_surface_lookup_fallback(
-        &self,
-        surface: &WlSurface,
-        kind: LookupFallbackKind,
-    ) -> bool {
+    fn allow_surface_lookup_fallback(&self, surface: &WlSurface, kind: LookupFallbackKind) -> bool {
         const BACKOFF_STEP: Duration = Duration::from_millis(100);
 
         let now = Instant::now();
@@ -3591,11 +3569,9 @@ impl Shell {
             SurfaceIndexRole::Sticky { output, key } => {
                 let output = self.output_from_weak(output)?;
                 let set = self.workspaces.sets.get(output)?;
-                set.sticky_layer
-                    .mapped()
-                    .find(|mapped| {
-                        mapped.key() == *key && mapped.has_surface(surface, WindowSurfaceType::ALL)
-                    })
+                set.sticky_layer.mapped().find(|mapped| {
+                    mapped.key() == *key && mapped.has_surface(surface, WindowSurfaceType::ALL)
+                })
             }
             SurfaceIndexRole::SetMinimized { output, key } => {
                 let output = self.output_from_weak(output)?;
@@ -3702,9 +3678,7 @@ impl Shell {
                         smithay::wayland::compositor::with_surface_tree_downward(
                             lock_surface.wl_surface(),
                             (),
-                            |_, _, _| {
-                                smithay::wayland::compositor::TraversalAction::DoChildren(())
-                            },
+                            |_, _, _| smithay::wayland::compositor::TraversalAction::DoChildren(()),
                             |candidate, _, _| {
                                 found.fetch_or(candidate == surface, Ordering::SeqCst);
                             },
@@ -3732,7 +3706,9 @@ impl Shell {
                         if let Some(move_grab) = seat.user_data().get::<SeatMoveGrabState>()
                             && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
                         {
-                            grab_state.element().has_surface(surface, WindowSurfaceType::ALL)
+                            grab_state
+                                .element()
+                                .has_surface(surface, WindowSurfaceType::ALL)
                         } else {
                             false
                         }
@@ -3793,7 +3769,10 @@ impl Shell {
         None
     }
 
-    fn indexed_workspace_for_surface(&self, surface: &WlSurface) -> Option<(WorkspaceHandle, Output)> {
+    fn indexed_workspace_for_surface(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<(WorkspaceHandle, Output)> {
         self.ensure_surface_index_populated();
         let Some(entry) = self.surface_index_entry(surface) else {
             self.note_surface_lookup_stats(|stats| stats.workspace_index_misses += 1);
@@ -3821,14 +3800,13 @@ impl Shell {
                     SurfaceIndexRole::WorkspaceMapped { .. } => workspace
                         .mapped()
                         .any(|mapped| mapped.has_surface(surface, WindowSurfaceType::ALL)),
-                    SurfaceIndexRole::WorkspaceMinimized { .. } => workspace
-                        .minimized_windows
-                        .iter()
-                        .any(|window| {
-                            window
-                                .mapped()
-                                .is_some_and(|mapped| mapped.has_surface(surface, WindowSurfaceType::ALL))
-                        }),
+                    SurfaceIndexRole::WorkspaceMinimized { .. } => {
+                        workspace.minimized_windows.iter().any(|window| {
+                            window.mapped().is_some_and(|mapped| {
+                                mapped.has_surface(surface, WindowSurfaceType::ALL)
+                            })
+                        })
+                    }
                     SurfaceIndexRole::WorkspaceFullscreen { .. } => workspace
                         .get_fullscreen()
                         .is_some_and(|window| window.has_surface(surface, WindowSurfaceType::ALL)),
@@ -3837,7 +3815,8 @@ impl Shell {
 
                 matches.then(|| (workspace.handle, workspace.output().clone()))
             }
-            SurfaceIndexRole::Sticky { .. } | SurfaceIndexRole::SetMinimized { .. }
+            SurfaceIndexRole::Sticky { .. }
+            | SurfaceIndexRole::SetMinimized { .. }
             | SurfaceIndexRole::SessionLock { .. }
             | SurfaceIndexRole::Cursor { .. }
             | SurfaceIndexRole::MoveGrab { .. }
@@ -3856,9 +3835,8 @@ impl Shell {
     }
 
     fn cached_output_hint_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
-        let cached = with_surface_commit_lookup_cache(surface, |cache| {
-            cache.output.lock().unwrap().clone()
-        });
+        let cached =
+            with_surface_commit_lookup_cache(surface, |cache| cache.output.lock().unwrap().clone());
 
         let Some(output) = cached
             .and_then(|output| output.upgrade())
@@ -3922,12 +3900,11 @@ impl Shell {
     }
 
     fn output_for_mapped(&self, mapped: &CosmicMapped) -> Option<&Output> {
-        if let Some((output, _)) = self
-            .workspaces
-            .sets
-            .iter()
-            .find(|(_, set)| set.sticky_layer.mapped().any(|candidate| candidate == mapped))
-        {
+        if let Some((output, _)) = self.workspaces.sets.iter().find(|(_, set)| {
+            set.sticky_layer
+                .mapped()
+                .any(|candidate| candidate == mapped)
+        }) {
             return Some(output);
         }
 
@@ -3973,7 +3950,11 @@ impl Shell {
             .cloned()
     }
 
-    pub fn should_schedule_layer_commit_render(&self, surface: &WlSurface, output: &Output) -> bool {
+    pub fn should_schedule_layer_commit_render(
+        &self,
+        surface: &WlSurface,
+        output: &Output,
+    ) -> bool {
         let min_interval = match self.overload_level() {
             OverloadLevel::Normal => return true,
             OverloadLevel::Soft => Duration::from_millis(33),
@@ -4042,10 +4023,7 @@ impl Shell {
             return true;
         }
 
-        if guard
-            .backoff_until
-            .is_some_and(|deadline| deadline > now)
-        {
+        if guard.backoff_until.is_some_and(|deadline| deadline > now) {
             self.note_commit_layer_arrange_skipped_unchanged();
             return false;
         }
@@ -4070,7 +4048,10 @@ impl Shell {
     }
 
     pub fn clear_layer_commit_guard(&self, surface: &WlSurface) {
-        self.layer_commit_guards.lock().unwrap().remove(&surface.id());
+        self.layer_commit_guards
+            .lock()
+            .unwrap()
+            .remove(&surface.id());
     }
 
     fn surface_visible_on_output(&self, surface: &WlSurface, output: &Output) -> bool {

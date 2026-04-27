@@ -122,8 +122,9 @@ fn note_main_loop_sample(sample: MainLoopSample) {
     counters.callback_us_max = counters.callback_us_max.max(callback_us);
 
     let update_us = duration_us(sample.update_animations);
-    counters.update_animations_us_total =
-        counters.update_animations_us_total.saturating_add(update_us);
+    counters.update_animations_us_total = counters
+        .update_animations_us_total
+        .saturating_add(update_us);
     counters.update_animations_us_max = counters.update_animations_us_max.max(update_us);
 
     let blocker_us = duration_us(sample.blocker_clear);
@@ -135,8 +136,9 @@ fn note_main_loop_sample(sample: MainLoopSample) {
     counters.refresh_us_max = counters.refresh_us_max.max(refresh_us);
 
     let schedule_us = duration_us(sample.animation_schedule);
-    counters.animation_schedule_us_total =
-        counters.animation_schedule_us_total.saturating_add(schedule_us);
+    counters.animation_schedule_us_total = counters
+        .animation_schedule_us_total
+        .saturating_add(schedule_us);
     counters.animation_schedule_us_max = counters.animation_schedule_us_max.max(schedule_us);
 
     let flush_us = duration_us(sample.flush_clients);
@@ -159,11 +161,13 @@ fn note_wayland_dispatch_sample(elapsed: Duration, dispatched: u64) {
     let elapsed_us = duration_us(elapsed);
 
     counters.dispatch_clients_calls = counters.dispatch_clients_calls.saturating_add(1);
-    counters.dispatch_clients_us_total =
-        counters.dispatch_clients_us_total.saturating_add(elapsed_us);
+    counters.dispatch_clients_us_total = counters
+        .dispatch_clients_us_total
+        .saturating_add(elapsed_us);
     counters.dispatch_clients_us_max = counters.dispatch_clients_us_max.max(elapsed_us);
-    counters.dispatch_clients_events_total =
-        counters.dispatch_clients_events_total.saturating_add(dispatched);
+    counters.dispatch_clients_events_total = counters
+        .dispatch_clients_events_total
+        .saturating_add(dispatched);
 
     maybe_log_main_loop_stats(&mut stats);
 }

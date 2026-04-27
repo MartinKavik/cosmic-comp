@@ -17,8 +17,7 @@ use smithay::{
     },
     output::Output,
     wayland::image_copy_capture::{
-        CaptureFailureReason, CursorSession, CursorSessionRef, Frame, FrameRef, Session,
-        SessionRef,
+        CaptureFailureReason, CursorSession, CursorSessionRef, Frame, FrameRef, Session, SessionRef,
     },
 };
 use tracing::warn;

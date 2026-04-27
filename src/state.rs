@@ -1402,7 +1402,12 @@ impl Common {
                 });
                 space.minimized_windows.iter().for_each(|m| {
                     for window in m.windows() {
-                        window.send_frame(output, time, throttle(&window, overload_level), |_, _| None);
+                        window.send_frame(
+                            output,
+                            time,
+                            throttle(&window, overload_level),
+                            |_, _| None,
+                        );
                     }
                 })
             }
