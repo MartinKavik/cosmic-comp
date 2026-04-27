@@ -248,12 +248,16 @@ impl Default for CommitAttributionStats {
 struct OverloadTracker {
     level: OverloadLevel,
     window_start: Instant,
+    last_stats_log: Instant,
     commits: u64,
     visible_schedules: u64,
     layer_schedules: u64,
     visible_budget_skips: u64,
     commit_us_total: u64,
     commit_us_max: u64,
+    main_loop_samples: u64,
+    main_loop_us_total: u64,
+    main_loop_us_max: u64,
     consecutive_soft_windows: u8,
     consecutive_hard_windows: u8,
     consecutive_normal_windows: u8,
@@ -264,12 +268,16 @@ impl Default for OverloadTracker {
         Self {
             level: OverloadLevel::Normal,
             window_start: Instant::now(),
+            last_stats_log: Instant::now(),
             commits: 0,
             visible_schedules: 0,
             layer_schedules: 0,
             visible_budget_skips: 0,
             commit_us_total: 0,
             commit_us_max: 0,
+            main_loop_samples: 0,
+            main_loop_us_total: 0,
+            main_loop_us_max: 0,
             consecutive_soft_windows: 0,
             consecutive_hard_windows: 0,
             consecutive_normal_windows: 0,
@@ -278,6 +286,14 @@ impl Default for OverloadTracker {
 }
 
 impl OverloadTracker {
+    fn note_main_loop(&mut self, elapsed: Duration) -> Option<OverloadTransition> {
+        let us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.main_loop_samples = self.main_loop_samples.saturating_add(1);
+        self.main_loop_us_total = self.main_loop_us_total.saturating_add(us);
+        self.main_loop_us_max = self.main_loop_us_max.max(us);
+        self.maybe_evaluate_window()
+    }
+
     fn note_commit(
         &mut self,
         schedule: CommitScheduleDecision,
@@ -295,6 +311,10 @@ impl OverloadTracker {
         self.commit_us_total = self.commit_us_total.saturating_add(us);
         self.commit_us_max = self.commit_us_max.max(us);
 
+        self.maybe_evaluate_window()
+    }
+
+    fn maybe_evaluate_window(&mut self) -> Option<OverloadTransition> {
         if self.window_start.elapsed() < Duration::from_secs(1) {
             return None;
         }
@@ -310,19 +330,34 @@ impl OverloadTracker {
             self.commit_us_total / commits
         };
         let max_commit_us = self.commit_us_max;
+        let main_loop_samples = self.main_loop_samples;
+        let avg_main_loop_us = if main_loop_samples == 0 {
+            0
+        } else {
+            self.main_loop_us_total / main_loop_samples
+        };
+        let max_main_loop_us = self.main_loop_us_max;
 
-        let severe_hard_signal =
-            commits >= 140 || visible_pressure >= 80 || avg_commit_us >= 2200 || max_commit_us >= 10000;
+        let severe_hard_signal = commits >= 140
+            || visible_pressure >= 80
+            || avg_commit_us >= 2200
+            || max_commit_us >= 10000
+            || avg_main_loop_us >= 8000
+            || max_main_loop_us >= 25000;
         let hard_signal = severe_hard_signal
             || commits >= 110
             || visible_pressure >= 65
             || avg_commit_us >= 1800
-            || max_commit_us >= 8000;
+            || max_commit_us >= 8000
+            || avg_main_loop_us >= 4000
+            || max_main_loop_us >= 16000;
         let soft_signal = hard_signal
             || commits >= 65
             || visible_pressure >= 45
             || avg_commit_us >= 800
-            || max_commit_us >= 4000;
+            || max_commit_us >= 4000
+            || avg_main_loop_us >= 2000
+            || max_main_loop_us >= 8000;
 
         if hard_signal {
             self.consecutive_hard_windows = self.consecutive_hard_windows.saturating_add(1);
@@ -363,6 +398,9 @@ impl OverloadTracker {
         self.visible_budget_skips = 0;
         self.commit_us_total = 0;
         self.commit_us_max = 0;
+        self.main_loop_samples = 0;
+        self.main_loop_us_total = 0;
+        self.main_loop_us_max = 0;
 
         (old_level != new_level).then_some(OverloadTransition {
             old_level,
@@ -374,11 +412,34 @@ impl OverloadTracker {
             visible_pressure,
             avg_commit_us,
             max_commit_us,
+            main_loop_samples,
+            avg_main_loop_us,
+            max_main_loop_us,
             hard_signal,
             soft_signal,
             consecutive_soft_windows: self.consecutive_soft_windows,
             consecutive_hard_windows: self.consecutive_hard_windows,
             consecutive_normal_windows: self.consecutive_normal_windows,
+        })
+    }
+
+    fn maybe_take_stats_snapshot(&mut self) -> Option<OverloadStatsSnapshot> {
+        if self.last_stats_log.elapsed() < Duration::from_secs(60) {
+            return None;
+        }
+
+        self.last_stats_log = Instant::now();
+        Some(OverloadStatsSnapshot {
+            level: self.level,
+            consecutive_soft_windows: self.consecutive_soft_windows,
+            consecutive_hard_windows: self.consecutive_hard_windows,
+            consecutive_normal_windows: self.consecutive_normal_windows,
+            current_window_commits: self.commits,
+            current_window_visible_schedules: self.visible_schedules,
+            current_window_layer_schedules: self.layer_schedules,
+            current_window_visible_budget_skips: self.visible_budget_skips,
+            current_window_main_loop_samples: self.main_loop_samples,
+            current_window_main_loop_us_max: self.main_loop_us_max,
         })
     }
 }
@@ -394,11 +455,28 @@ struct OverloadTransition {
     visible_pressure: u64,
     avg_commit_us: u64,
     max_commit_us: u64,
+    main_loop_samples: u64,
+    avg_main_loop_us: u64,
+    max_main_loop_us: u64,
     hard_signal: bool,
     soft_signal: bool,
     consecutive_soft_windows: u8,
     consecutive_hard_windows: u8,
     consecutive_normal_windows: u8,
+}
+
+#[derive(Debug)]
+struct OverloadStatsSnapshot {
+    level: OverloadLevel,
+    consecutive_soft_windows: u8,
+    consecutive_hard_windows: u8,
+    consecutive_normal_windows: u8,
+    current_window_commits: u64,
+    current_window_visible_schedules: u64,
+    current_window_layer_schedules: u64,
+    current_window_visible_budget_skips: u64,
+    current_window_main_loop_samples: u64,
+    current_window_main_loop_us_max: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2761,12 +2839,66 @@ impl Shell {
                 visible_pressure_per_sec = transition.visible_pressure,
                 avg_commit_us = transition.avg_commit_us,
                 max_commit_us = transition.max_commit_us,
+                main_loop_samples_per_sec = transition.main_loop_samples,
+                avg_main_loop_us = transition.avg_main_loop_us,
+                max_main_loop_us = transition.max_main_loop_us,
                 hard_signal = transition.hard_signal,
                 soft_signal = transition.soft_signal,
                 consecutive_soft_windows = transition.consecutive_soft_windows,
                 consecutive_hard_windows = transition.consecutive_hard_windows,
                 consecutive_normal_windows = transition.consecutive_normal_windows,
                 "[perf] compositor overload transition"
+            );
+        }
+    }
+
+    pub fn note_main_loop_elapsed(&self, elapsed: Duration) {
+        let (transition, snapshot) = {
+            let mut tracker = self.overload_tracker.lock().unwrap();
+            let transition = tracker.note_main_loop(elapsed);
+            let snapshot = tracker.maybe_take_stats_snapshot();
+            (transition, snapshot)
+        };
+
+        if let Some(transition) = transition {
+            warn!(
+                old_level = ?transition.old_level,
+                new_level = ?transition.new_level,
+                commits_per_sec = transition.commits,
+                visible_schedules_per_sec = transition.visible_schedules,
+                layer_schedules_per_sec = transition.layer_schedules,
+                visible_budget_skips_per_sec = transition.visible_budget_skips,
+                visible_pressure_per_sec = transition.visible_pressure,
+                avg_commit_us = transition.avg_commit_us,
+                max_commit_us = transition.max_commit_us,
+                main_loop_samples_per_sec = transition.main_loop_samples,
+                avg_main_loop_us = transition.avg_main_loop_us,
+                max_main_loop_us = transition.max_main_loop_us,
+                hard_signal = transition.hard_signal,
+                soft_signal = transition.soft_signal,
+                consecutive_soft_windows = transition.consecutive_soft_windows,
+                consecutive_hard_windows = transition.consecutive_hard_windows,
+                consecutive_normal_windows = transition.consecutive_normal_windows,
+                "[perf] compositor overload transition"
+            );
+        }
+
+        if let Some(snapshot) = snapshot {
+            warn!(
+                overload_level = ?snapshot.level,
+                consecutive_soft_windows = snapshot.consecutive_soft_windows,
+                consecutive_hard_windows = snapshot.consecutive_hard_windows,
+                consecutive_normal_windows = snapshot.consecutive_normal_windows,
+                current_window_commits = snapshot.current_window_commits,
+                current_window_visible_schedules = snapshot.current_window_visible_schedules,
+                current_window_layer_schedules = snapshot.current_window_layer_schedules,
+                current_window_visible_budget_skips =
+                    snapshot.current_window_visible_budget_skips,
+                current_window_main_loop_samples = snapshot.current_window_main_loop_samples,
+                current_window_main_loop_us_max = snapshot.current_window_main_loop_us_max,
+                surface_index_entries = self.surface_index.lock().unwrap().len(),
+                client_visible_budget_entries = self.client_visible_budgets.lock().unwrap().len(),
+                "[perf] overload residency stats"
             );
         }
     }

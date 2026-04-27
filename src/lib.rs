@@ -21,7 +21,7 @@ use std::{
     ffi::OsString,
     os::unix::process::CommandExt,
     process,
-    sync::Arc,
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -55,6 +55,163 @@ pub mod xwayland;
 #[global_allocator]
 static GLOBAL: profiling::tracy_client::ProfiledAllocator<std::alloc::System> =
     profiling::tracy_client::ProfiledAllocator::new(std::alloc::System, 10);
+
+static MAIN_LOOP_STATS: LazyLock<Mutex<MainLoopStats>> =
+    LazyLock::new(|| Mutex::new(MainLoopStats::default()));
+
+#[derive(Default)]
+struct MainLoopCounters {
+    callbacks: u64,
+    callback_us_total: u64,
+    callback_us_max: u64,
+    update_animations_us_total: u64,
+    update_animations_us_max: u64,
+    blocker_clear_us_total: u64,
+    blocker_clear_us_max: u64,
+    refresh_us_total: u64,
+    refresh_us_max: u64,
+    animation_schedule_us_total: u64,
+    animation_schedule_us_max: u64,
+    flush_clients_us_total: u64,
+    flush_clients_us_max: u64,
+    dispatch_clients_calls: u64,
+    dispatch_clients_us_total: u64,
+    dispatch_clients_us_max: u64,
+    dispatch_clients_events_total: u64,
+    animation_outputs_scheduled: u64,
+    animation_active_callbacks: u64,
+}
+
+struct MainLoopStats {
+    last_log: Instant,
+    counters: MainLoopCounters,
+}
+
+impl Default for MainLoopStats {
+    fn default() -> Self {
+        Self {
+            last_log: Instant::now(),
+            counters: MainLoopCounters::default(),
+        }
+    }
+}
+
+struct MainLoopSample {
+    callback: Duration,
+    update_animations: Duration,
+    blocker_clear: Duration,
+    refresh: Duration,
+    animation_schedule: Duration,
+    flush_clients: Duration,
+    animation_outputs_scheduled: u64,
+    animations_active: bool,
+}
+
+fn duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn note_main_loop_sample(sample: MainLoopSample) {
+    let mut stats = MAIN_LOOP_STATS.lock().unwrap();
+    let counters = &mut stats.counters;
+
+    counters.callbacks = counters.callbacks.saturating_add(1);
+
+    let callback_us = duration_us(sample.callback);
+    counters.callback_us_total = counters.callback_us_total.saturating_add(callback_us);
+    counters.callback_us_max = counters.callback_us_max.max(callback_us);
+
+    let update_us = duration_us(sample.update_animations);
+    counters.update_animations_us_total =
+        counters.update_animations_us_total.saturating_add(update_us);
+    counters.update_animations_us_max = counters.update_animations_us_max.max(update_us);
+
+    let blocker_us = duration_us(sample.blocker_clear);
+    counters.blocker_clear_us_total = counters.blocker_clear_us_total.saturating_add(blocker_us);
+    counters.blocker_clear_us_max = counters.blocker_clear_us_max.max(blocker_us);
+
+    let refresh_us = duration_us(sample.refresh);
+    counters.refresh_us_total = counters.refresh_us_total.saturating_add(refresh_us);
+    counters.refresh_us_max = counters.refresh_us_max.max(refresh_us);
+
+    let schedule_us = duration_us(sample.animation_schedule);
+    counters.animation_schedule_us_total =
+        counters.animation_schedule_us_total.saturating_add(schedule_us);
+    counters.animation_schedule_us_max = counters.animation_schedule_us_max.max(schedule_us);
+
+    let flush_us = duration_us(sample.flush_clients);
+    counters.flush_clients_us_total = counters.flush_clients_us_total.saturating_add(flush_us);
+    counters.flush_clients_us_max = counters.flush_clients_us_max.max(flush_us);
+
+    counters.animation_outputs_scheduled = counters
+        .animation_outputs_scheduled
+        .saturating_add(sample.animation_outputs_scheduled);
+    if sample.animations_active {
+        counters.animation_active_callbacks = counters.animation_active_callbacks.saturating_add(1);
+    }
+
+    maybe_log_main_loop_stats(&mut stats);
+}
+
+fn note_wayland_dispatch_sample(elapsed: Duration, dispatched: u64) {
+    let mut stats = MAIN_LOOP_STATS.lock().unwrap();
+    let counters = &mut stats.counters;
+    let elapsed_us = duration_us(elapsed);
+
+    counters.dispatch_clients_calls = counters.dispatch_clients_calls.saturating_add(1);
+    counters.dispatch_clients_us_total =
+        counters.dispatch_clients_us_total.saturating_add(elapsed_us);
+    counters.dispatch_clients_us_max = counters.dispatch_clients_us_max.max(elapsed_us);
+    counters.dispatch_clients_events_total =
+        counters.dispatch_clients_events_total.saturating_add(dispatched);
+
+    maybe_log_main_loop_stats(&mut stats);
+}
+
+fn maybe_log_main_loop_stats(stats: &mut MainLoopStats) {
+    if stats.last_log.elapsed() < Duration::from_secs(60) {
+        return;
+    }
+
+    let counters = std::mem::take(&mut stats.counters);
+    stats.last_log = Instant::now();
+
+    let avg_callback_us = if counters.callbacks == 0 {
+        0
+    } else {
+        counters.callback_us_total / counters.callbacks
+    };
+    let avg_dispatch_clients_us = if counters.dispatch_clients_calls == 0 {
+        0
+    } else {
+        counters.dispatch_clients_us_total / counters.dispatch_clients_calls
+    };
+
+    warn!(
+        callbacks = counters.callbacks,
+        callback_us_total = counters.callback_us_total,
+        callback_us_avg = avg_callback_us,
+        callback_us_max = counters.callback_us_max,
+        update_animations_us_total = counters.update_animations_us_total,
+        update_animations_us_max = counters.update_animations_us_max,
+        blocker_clear_us_total = counters.blocker_clear_us_total,
+        blocker_clear_us_max = counters.blocker_clear_us_max,
+        refresh_us_total = counters.refresh_us_total,
+        refresh_us_max = counters.refresh_us_max,
+        animation_schedule_us_total = counters.animation_schedule_us_total,
+        animation_schedule_us_max = counters.animation_schedule_us_max,
+        flush_clients_us_total = counters.flush_clients_us_total,
+        flush_clients_us_max = counters.flush_clients_us_max,
+        dispatch_clients_calls = counters.dispatch_clients_calls,
+        dispatch_clients_events_total = counters.dispatch_clients_events_total,
+        dispatch_clients_us_total = counters.dispatch_clients_us_total,
+        dispatch_clients_us_avg = avg_dispatch_clients_us,
+        dispatch_clients_us_max = counters.dispatch_clients_us_max,
+        animation_outputs_scheduled = counters.animation_outputs_scheduled,
+        animation_active_callbacks = counters.animation_active_callbacks,
+        "[perf] main loop stats"
+    );
+}
 
 // called by the Xwayland source, either after starting or failing
 impl State {
@@ -173,6 +330,8 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
 
     // run the event loop
     event_loop.run(None, &mut state, |state| {
+        let callback_start = Instant::now();
+
         // shall we shut down?
         if state.common.should_stop {
             info!("Shutting down");
@@ -182,27 +341,62 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
         }
 
         // trigger routines
+        let update_animations_start = Instant::now();
         let clients = state.common.shell.write().update_animations();
+        let update_animations_elapsed = update_animations_start.elapsed();
+
+        let blocker_clear_start = Instant::now();
         {
             let dh = state.common.display_handle.clone();
             for client in clients.values() {
                 client_compositor_state(client).blocker_cleared(state, &dh);
             }
         }
+        let blocker_clear_elapsed = blocker_clear_start.elapsed();
 
+        let refresh_start = Instant::now();
         refresh(state);
+        let refresh_elapsed = refresh_start.elapsed();
 
+        let animation_schedule_start = Instant::now();
+        let mut animation_outputs_scheduled = 0;
+        let mut animations_active = false;
         {
             let shell = state.common.shell.read();
             if shell.animations_going() {
-                for output in shell.outputs().cloned().collect::<Vec<_>>().into_iter() {
+                animations_active = true;
+                let outputs = shell.outputs().cloned().collect::<Vec<_>>();
+                std::mem::drop(shell);
+                animation_outputs_scheduled = outputs.len() as u64;
+                for output in outputs.into_iter() {
                     state.backend.schedule_render(&output);
                 }
+            } else {
+                std::mem::drop(shell);
             }
         }
+        let animation_schedule_elapsed = animation_schedule_start.elapsed();
 
         // send out events
+        let flush_start = Instant::now();
         let _ = state.common.display_handle.flush_clients();
+        let flush_elapsed = flush_start.elapsed();
+        let callback_elapsed = callback_start.elapsed();
+        state
+            .common
+            .shell
+            .read()
+            .note_main_loop_elapsed(callback_elapsed);
+        note_main_loop_sample(MainLoopSample {
+            callback: callback_elapsed,
+            update_animations: update_animations_elapsed,
+            blocker_clear: blocker_clear_elapsed,
+            refresh: refresh_elapsed,
+            animation_schedule: animation_schedule_elapsed,
+            flush_clients: flush_elapsed,
+            animation_outputs_scheduled,
+            animations_active,
+        });
 
         // check if kiosk child is running
         if let Some(child) = state.common.kiosk_child.as_mut() {
@@ -285,9 +479,14 @@ fn init_wayland_display(
             Generic::new(display, Interest::READ, Mode::Level),
             move |_, display, state| {
                 // SAFETY: We don't drop the display
+                let dispatch_start = Instant::now();
                 match unsafe { display.get_mut().dispatch_clients(state) } {
-                    Ok(_) => Ok(PostAction::Continue),
+                    Ok(dispatched) => {
+                        note_wayland_dispatch_sample(dispatch_start.elapsed(), dispatched as u64);
+                        Ok(PostAction::Continue)
+                    }
                     Err(err) => {
+                        note_wayland_dispatch_sample(dispatch_start.elapsed(), 0);
                         error!(?err, "I/O error on the Wayland display");
                         state.common.should_stop = true;
                         Err(err)
