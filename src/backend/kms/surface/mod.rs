@@ -92,7 +92,7 @@ use std::{
     collections::{HashMap, HashSet, hash_map},
     mem,
     sync::{
-        Arc, RwLock,
+        Arc, LazyLock, RwLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender},
     },
@@ -103,6 +103,12 @@ use std::{
 
 mod timings;
 pub use self::timings::Timings;
+
+static SURFACE_SCHEDULE_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+fn schedule_time_ms() -> u64 {
+    SURFACE_SCHEDULE_EPOCH.elapsed().as_millis() as u64
+}
 
 use super::{drm_helpers, render::gles::GbmGlowBackend};
 
@@ -241,13 +247,17 @@ struct SurfaceScheduleMetrics {
     schedule_dispatched: AtomicU64,
     schedule_suppressed_pending: AtomicU64,
     schedule_thread_commands: AtomicU64,
+    schedule_command_latency_ms_total: AtomicU64,
+    schedule_command_latency_ms_max: AtomicU64,
     schedule_startup_skips: AtomicU64,
     schedule_dpms_off_skips: AtomicU64,
+    schedule_pending_age_ms_max: AtomicU64,
     queue_redraw_queued_new: AtomicU64,
     queue_redraw_queued_from_estimated_vblank: AtomicU64,
     queue_redraw_already_queued: AtomicU64,
     queue_redraw_waiting_for_vblank: AtomicU64,
     queue_redraw_force_replaced: AtomicU64,
+    pending_since_ms: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -419,6 +429,7 @@ impl Surface {
         self.schedule_metrics
             .schedule_requested
             .fetch_add(1, Ordering::Relaxed);
+        let now_ms = schedule_time_ms();
 
         if !self.dpms {
             self.schedule_metrics
@@ -428,6 +439,16 @@ impl Surface {
         }
 
         if self.render_request_pending.swap(true, Ordering::AcqRel) {
+            let pending_since_ms = self
+                .schedule_metrics
+                .pending_since_ms
+                .load(Ordering::Relaxed);
+            if pending_since_ms != 0 {
+                self.schedule_metrics.schedule_pending_age_ms_max.fetch_max(
+                    now_ms.saturating_sub(pending_since_ms),
+                    Ordering::Relaxed,
+                );
+            }
             self.schedule_metrics
                 .schedule_suppressed_pending
                 .fetch_add(1, Ordering::Relaxed);
@@ -435,12 +456,23 @@ impl Surface {
         }
 
         self.schedule_metrics
+            .pending_since_ms
+            .store(now_ms, Ordering::Relaxed);
+
+        self.schedule_metrics
             .schedule_dispatched
             .fetch_add(1, Ordering::Relaxed);
 
         if self.thread_command.send(ThreadCommand::ScheduleRender).is_err() {
             self.render_request_pending.store(false, Ordering::Release);
+            self.schedule_metrics
+                .pending_since_ms
+                .store(0, Ordering::Relaxed);
         }
+    }
+
+    pub fn render_request_pending(&self) -> bool {
+        self.render_request_pending.load(Ordering::Acquire)
     }
 
     pub fn set_mirroring(&mut self, output: Option<Output>) {
@@ -646,6 +678,21 @@ fn surface_thread(
                 state.on_vblank(metadata);
             }
             Event::Msg(ThreadCommand::ScheduleRender) => {
+                let pending_since_ms = state
+                    .schedule_metrics
+                    .pending_since_ms
+                    .swap(0, Ordering::Relaxed);
+                if pending_since_ms != 0 {
+                    let latency_ms = schedule_time_ms().saturating_sub(pending_since_ms);
+                    state
+                        .schedule_metrics
+                        .schedule_command_latency_ms_total
+                        .fetch_add(latency_ms, Ordering::Relaxed);
+                    state
+                        .schedule_metrics
+                        .schedule_command_latency_ms_max
+                        .fetch_max(latency_ms, Ordering::Relaxed);
+                }
                 state
                     .schedule_metrics
                     .schedule_thread_commands
@@ -760,6 +807,14 @@ impl SurfaceThreadState {
                 .schedule_metrics
                 .schedule_thread_commands
                 .swap(0, Ordering::Relaxed),
+            schedule_command_latency_ms_total = self
+                .schedule_metrics
+                .schedule_command_latency_ms_total
+                .swap(0, Ordering::Relaxed),
+            schedule_command_latency_ms_max = self
+                .schedule_metrics
+                .schedule_command_latency_ms_max
+                .swap(0, Ordering::Relaxed),
             schedule_startup_skips = self
                 .schedule_metrics
                 .schedule_startup_skips
@@ -767,6 +822,10 @@ impl SurfaceThreadState {
             schedule_dpms_off_skips = self
                 .schedule_metrics
                 .schedule_dpms_off_skips
+                .swap(0, Ordering::Relaxed),
+            schedule_pending_age_ms_max = self
+                .schedule_metrics
+                .schedule_pending_age_ms_max
                 .swap(0, Ordering::Relaxed),
             queue_redraw_queued_new = self
                 .schedule_metrics

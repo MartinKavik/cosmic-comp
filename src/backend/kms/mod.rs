@@ -170,6 +170,7 @@ struct InputRedrawStats {
     schedule_throttled: u64,
     pointer_motion_schedule_throttled: u64,
     broad_schedule_throttled: u64,
+    pending_render_throttled: u64,
 }
 
 impl Default for InputRedrawStats {
@@ -191,6 +192,7 @@ impl Default for InputRedrawStats {
             schedule_throttled: 0,
             pointer_motion_schedule_throttled: 0,
             broad_schedule_throttled: 0,
+            pending_render_throttled: 0,
         }
     }
 }
@@ -629,6 +631,17 @@ impl KmsState {
         }
 
         let now = Instant::now();
+        if matches!(scope, InputRedrawScope::Broad)
+            && overload_level != OverloadLevel::Normal
+            && self.output_render_request_pending(output)
+        {
+            self.input_redraw_stats.schedule_throttled += 1;
+            self.input_redraw_stats.broad_schedule_throttled += 1;
+            self.input_redraw_stats.pending_render_throttled += 1;
+            self.maybe_log_input_redraw_stats();
+            return;
+        }
+
         if self
             .input_redraw_last
             .get(output)
@@ -661,6 +674,14 @@ impl KmsState {
         self.maybe_log_input_redraw_stats();
     }
 
+    fn output_render_request_pending(&self, output: &Output) -> bool {
+        self.drm_devices
+            .values()
+            .flat_map(|d| d.inner.surfaces.values())
+            .filter(|s| s.output == *output || s.output.mirroring().is_some_and(|o| &o == output))
+            .any(|surface| surface.render_request_pending())
+    }
+
     fn maybe_log_input_redraw_stats(&mut self) {
         if self.input_redraw_stats.last_log.elapsed() < Duration::from_secs(60) {
             return;
@@ -685,6 +706,7 @@ impl KmsState {
             input_pointer_motion_schedule_throttled =
                 self.input_redraw_stats.pointer_motion_schedule_throttled,
             input_broad_schedule_throttled = self.input_redraw_stats.broad_schedule_throttled,
+            input_pending_render_throttled = self.input_redraw_stats.pending_render_throttled,
             "[perf] kms input render stats"
         );
 
