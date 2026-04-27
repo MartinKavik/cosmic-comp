@@ -689,6 +689,8 @@ struct SurfaceLookupCounters {
     commit_schedule_client_budget_skips: u64,
     commit_schedule_client_output_budget_skips: u64,
     commit_schedule_layer_render_skips: u64,
+    commit_schedule_deferred_visible_renders: u64,
+    commit_schedule_deferred_visible_render_coalesced: u64,
     commit_layer_arrange_changed: u64,
     commit_layer_arrange_unchanged: u64,
     commit_layer_arrange_skipped_unchanged: u64,
@@ -972,6 +974,7 @@ pub struct Shell {
     pub xwayland_keyboard_grab: Option<XWaylandKeyboardGrab<State>>,
     surface_index: Mutex<HashMap<ObjectId, SurfaceIndexEntry>>,
     layer_commit_guards: Mutex<HashMap<ObjectId, LayerCommitGuardState>>,
+    deferred_visible_render_guards: Mutex<HashMap<String, Instant>>,
     surface_lookup_stats: Mutex<SurfaceLookupStats>,
     commit_attribution_stats: Mutex<CommitAttributionStats>,
     overload_tracker: Mutex<OverloadTracker>,
@@ -2307,6 +2310,7 @@ impl Shell {
             xwayland_keyboard_grab: None,
             surface_index: Mutex::new(HashMap::new()),
             layer_commit_guards: Mutex::new(HashMap::new()),
+            deferred_visible_render_guards: Mutex::new(HashMap::new()),
             surface_lookup_stats: Mutex::new(SurfaceLookupStats::default()),
             commit_attribution_stats: Mutex::new(CommitAttributionStats::default()),
             overload_tracker: Mutex::new(OverloadTracker::default()),
@@ -2661,6 +2665,10 @@ impl Shell {
                     counters.commit_schedule_client_output_budget_skips,
                 commit_schedule_layer_render_skips =
                     counters.commit_schedule_layer_render_skips,
+                commit_schedule_deferred_visible_renders =
+                    counters.commit_schedule_deferred_visible_renders,
+                commit_schedule_deferred_visible_render_coalesced =
+                    counters.commit_schedule_deferred_visible_render_coalesced,
                 commit_layer_arrange_changed = counters.commit_layer_arrange_changed,
                 commit_layer_arrange_unchanged = counters.commit_layer_arrange_unchanged,
                 commit_layer_arrange_skipped_unchanged =
@@ -2769,6 +2777,51 @@ impl Shell {
 
     pub fn note_commit_schedule_layer_render_skip(&self) {
         self.note_surface_lookup_stats(|stats| stats.commit_schedule_layer_render_skips += 1);
+    }
+
+    fn note_commit_schedule_deferred_visible_render(&self) {
+        self.note_surface_lookup_stats(|stats| {
+            stats.commit_schedule_deferred_visible_renders += 1
+        });
+    }
+
+    fn note_commit_schedule_deferred_visible_render_coalesced(&self) {
+        self.note_surface_lookup_stats(|stats| {
+            stats.commit_schedule_deferred_visible_render_coalesced += 1
+        });
+    }
+
+    pub fn request_deferred_visible_render(
+        &self,
+        output: &Output,
+        delay: Duration,
+    ) -> Option<Duration> {
+        const STALE_DEFERRED_RENDER: Duration = Duration::from_secs(2);
+
+        let now = Instant::now();
+        let due = now + delay;
+        let key = output.name();
+        let mut guards = self.deferred_visible_render_guards.lock().unwrap();
+
+        if let Some(existing_due) = guards.get(&key) {
+            if *existing_due > now && existing_due.duration_since(now) <= STALE_DEFERRED_RENDER {
+                std::mem::drop(guards);
+                self.note_commit_schedule_deferred_visible_render_coalesced();
+                return None;
+            }
+        }
+
+        guards.insert(key, due);
+        std::mem::drop(guards);
+        self.note_commit_schedule_deferred_visible_render();
+        Some(delay)
+    }
+
+    pub fn clear_deferred_visible_render(&self, output: &Output) {
+        self.deferred_visible_render_guards
+            .lock()
+            .unwrap()
+            .remove(&output.name());
     }
 
     pub fn note_commit_layer_arrange(&self, changed: bool) {

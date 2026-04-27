@@ -5,7 +5,10 @@ use crate::{
     state::ClientState,
     utils::prelude::*,
 };
-use calloop::Interest;
+use calloop::{
+    Interest, LoopHandle,
+    timer::{TimeoutAction, Timer},
+};
 use smithay::{
     backend::renderer::{
         element::{Kind, surface::KindEvaluation},
@@ -13,6 +16,7 @@ use smithay::{
     },
     delegate_compositor,
     desktop::{LayerSurface, PopupKind, layer_map_for_output},
+    output::Output,
     reexports::wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     utils::{Clock, Logical, Monotonic, SERIAL_COUNTER, Size, Time},
     wayland::{
@@ -34,6 +38,25 @@ use smithay::{
     xwayland::XWaylandClientData,
 };
 use std::{collections::VecDeque, sync::Mutex, time::{Duration, Instant}};
+use tracing::warn;
+
+fn schedule_deferred_output_render(
+    loop_handle: &LoopHandle<'static, State>,
+    output: Output,
+    delay: Duration,
+) {
+    if let Err(err) = loop_handle.insert_source(Timer::from_duration(delay), move |_, _, state| {
+        state.backend.schedule_render(&output);
+        state
+            .common
+            .shell
+            .read()
+            .clear_deferred_visible_render(&output);
+        TimeoutAction::Drop
+    }) {
+        warn!(?err, "failed to schedule deferred visible render");
+    }
+}
 
 fn toplevel_ensure_initial_configure(
     toplevel: &ToplevelSurface,
@@ -294,6 +317,7 @@ impl CompositorHandler for State {
         };
 
         // schedule a new render
+        const DEFERRED_VISIBLE_RENDER_DELAY: Duration = Duration::from_millis(16);
         let visible_schedule_decision = visible_output
             .as_ref()
             .map(|output| shell.visible_commit_schedule_decision(surface, output, commit_pid));
@@ -302,6 +326,18 @@ impl CompositorHandler for State {
         } else {
             visible_schedule_decision.unwrap_or(CommitScheduleDecision::Miss)
         };
+        let deferred_visible_render = visible_output.as_ref().and_then(|output| {
+            matches!(
+                visible_schedule_decision,
+                Some(CommitScheduleDecision::VisibleBudgetSkipped)
+            )
+            .then(|| {
+                shell
+                    .request_deferred_visible_render(output, DEFERRED_VISIBLE_RENDER_DELAY)
+                    .map(|delay| (output.clone(), delay))
+            })
+            .flatten()
+        });
 
         let layer_schedule_output = layer_output
             .as_ref()
@@ -313,6 +349,9 @@ impl CompositorHandler for State {
                     .flatten())
         {
             self.backend.schedule_render(output);
+        }
+        if let Some((output, delay)) = deferred_visible_render {
+            schedule_deferred_output_render(&self.common.event_loop_handle, output, delay);
         }
         shell.note_commit_schedule_decision(schedule_decision);
 
