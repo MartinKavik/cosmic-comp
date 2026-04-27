@@ -1023,6 +1023,8 @@ static PENDING_RESIZE_COMMIT_WINDOWS: LazyLock<Mutex<HashSet<CosmicMappedKey>>> 
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static COMMON_REFRESH_STATS: LazyLock<Mutex<CommonRefreshStats>> =
     LazyLock::new(|| Mutex::new(CommonRefreshStats::default()));
+static TOPLEVEL_INFO_REFRESH_LAST: LazyLock<Mutex<Option<Instant>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 #[derive(Default)]
 struct CommonRefreshCounters {
@@ -1035,6 +1037,8 @@ struct CommonRefreshCounters {
     shell_us_max: u64,
     popups_us_total: u64,
     popups_us_max: u64,
+    toplevel_info_calls: u64,
+    toplevel_info_skips: u64,
     toplevel_info_us_total: u64,
     toplevel_info_us_max: u64,
     idle_inhibit_us_total: u64,
@@ -1064,6 +1068,7 @@ struct CommonRefreshSample {
     activation: Duration,
     shell: Duration,
     popups: Duration,
+    toplevel_info_refreshed: bool,
     toplevel_info: Duration,
     idle_inhibit: Duration,
     a11y_keyboard: Duration,
@@ -1095,6 +1100,12 @@ fn note_common_refresh_sample(sample: CommonRefreshSample) {
     let popups_us = common_refresh_duration_us(sample.popups);
     counters.popups_us_total = counters.popups_us_total.saturating_add(popups_us);
     counters.popups_us_max = counters.popups_us_max.max(popups_us);
+
+    if sample.toplevel_info_refreshed {
+        counters.toplevel_info_calls = counters.toplevel_info_calls.saturating_add(1);
+    } else {
+        counters.toplevel_info_skips = counters.toplevel_info_skips.saturating_add(1);
+    }
 
     let toplevel_info_us = common_refresh_duration_us(sample.toplevel_info);
     counters.toplevel_info_us_total = counters
@@ -1140,7 +1151,12 @@ fn note_common_refresh_sample(sample: CommonRefreshSample) {
         refresh_shell_us_max = counters.shell_us_max,
         refresh_popups_us_avg = avg(counters.popups_us_total, counters.calls),
         refresh_popups_us_max = counters.popups_us_max,
-        refresh_toplevel_info_us_avg = avg(counters.toplevel_info_us_total, counters.calls),
+        refresh_toplevel_info_calls = counters.toplevel_info_calls,
+        refresh_toplevel_info_skips = counters.toplevel_info_skips,
+        refresh_toplevel_info_us_avg = avg(
+            counters.toplevel_info_us_total,
+            counters.toplevel_info_calls
+        ),
         refresh_toplevel_info_us_max = counters.toplevel_info_us_max,
         refresh_idle_inhibit_us_avg = avg(counters.idle_inhibit_us_total, counters.calls),
         refresh_idle_inhibit_us_max = counters.idle_inhibit_us_max,
@@ -1150,6 +1166,22 @@ fn note_common_refresh_sample(sample: CommonRefreshSample) {
         refresh_capture_cleanup_us_max = counters.capture_cleanup_us_max,
         "[perf] common refresh stats"
     );
+}
+
+fn should_refresh_toplevel_info(overload_level: OverloadLevel, now: Instant) -> bool {
+    let min_interval = match overload_level {
+        OverloadLevel::Normal => Duration::ZERO,
+        OverloadLevel::Soft => Duration::from_millis(750),
+        OverloadLevel::Hard => Duration::from_millis(1500),
+    };
+
+    let mut last = TOPLEVEL_INFO_REFRESH_LAST.lock().unwrap();
+    if last.is_none_or(|instant| now.duration_since(instant) >= min_interval) {
+        *last = Some(now);
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2345,6 +2377,7 @@ impl Common {
     #[profiling::function]
     pub fn refresh(&mut self) {
         let total_start = Instant::now();
+        let overload_level = self.shell.read().overload_level();
 
         let activation_start = Instant::now();
         self.xdg_activation_state
@@ -2362,9 +2395,15 @@ impl Common {
         self.popups.cleanup();
         let popups_elapsed = popups_start.elapsed();
 
-        let toplevel_info_start = Instant::now();
-        self.toplevel_info_state.refresh(&self.workspace_state);
-        let toplevel_info_elapsed = toplevel_info_start.elapsed();
+        let now = Instant::now();
+        let (toplevel_info_refreshed, toplevel_info_elapsed) =
+            if should_refresh_toplevel_info(overload_level, now) {
+                let toplevel_info_start = Instant::now();
+                self.toplevel_info_state.refresh(&self.workspace_state);
+                (true, toplevel_info_start.elapsed())
+            } else {
+                (false, Duration::ZERO)
+            };
 
         let idle_inhibit_start = Instant::now();
         self.refresh_idle_inhibit();
@@ -2383,6 +2422,7 @@ impl Common {
             activation: activation_elapsed,
             shell: shell_elapsed,
             popups: popups_elapsed,
+            toplevel_info_refreshed,
             toplevel_info: toplevel_info_elapsed,
             idle_inhibit: idle_inhibit_elapsed,
             a11y_keyboard: a11y_keyboard_elapsed,
