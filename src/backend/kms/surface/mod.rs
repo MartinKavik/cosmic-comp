@@ -467,15 +467,19 @@ impl Surface {
             .send(ThreadCommand::ScheduleRender)
             .is_err()
         {
-            self.render_request_pending.store(false, Ordering::Release);
-            self.schedule_metrics
-                .pending_since_ms
-                .store(0, Ordering::Relaxed);
+            self.clear_render_request_pending();
         }
     }
 
     pub fn render_request_pending(&self) -> bool {
         self.render_request_pending.load(Ordering::Acquire)
+    }
+
+    fn clear_render_request_pending(&self) {
+        self.render_request_pending.store(false, Ordering::Release);
+        self.schedule_metrics
+            .pending_since_ms
+            .store(0, Ordering::Relaxed);
     }
 
     pub fn set_mirroring(&mut self, output: Option<Output>) {
@@ -511,7 +515,7 @@ impl Surface {
     }
 
     pub fn suspend(&mut self) {
-        self.render_request_pending.store(false, Ordering::Release);
+        self.clear_render_request_pending();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let _ = self.thread_command.send(ThreadCommand::Suspend(tx));
         let _ = rx.recv();
@@ -527,7 +531,7 @@ impl Surface {
         self.overlay_plane_formats = overlay_plane_formats;
         self.feedback.clear();
         self.active.store(true, Ordering::SeqCst);
-        self.render_request_pending.store(false, Ordering::Release);
+        self.clear_render_request_pending();
 
         let _ = self
             .thread_command
@@ -544,7 +548,7 @@ impl Surface {
             if on {
                 self.schedule_render();
             } else {
-                self.render_request_pending.store(false, Ordering::Release);
+                self.clear_render_request_pending();
                 let _ = self.thread_command.send(ThreadCommand::DpmsOff);
             }
         }
@@ -684,7 +688,7 @@ fn surface_thread(
                 let pending_since_ms = state
                     .schedule_metrics
                     .pending_since_ms
-                    .swap(0, Ordering::Relaxed);
+                    .load(Ordering::Relaxed);
                 if pending_since_ms != 0 {
                     let latency_ms = schedule_time_ms().saturating_sub(pending_since_ms);
                     state
@@ -701,7 +705,7 @@ fn surface_thread(
                     .schedule_thread_commands
                     .fetch_add(1, Ordering::Relaxed);
                 if !startup_done.load(Ordering::SeqCst) {
-                    state.render_request_pending.store(false, Ordering::Release);
+                    state.clear_render_request_pending();
                     state
                         .schedule_metrics
                         .schedule_startup_skips
@@ -854,9 +858,16 @@ impl SurfaceThreadState {
         );
     }
 
+    fn clear_render_request_pending(&self) {
+        self.render_request_pending.store(false, Ordering::Release);
+        self.schedule_metrics
+            .pending_since_ms
+            .store(0, Ordering::Relaxed);
+    }
+
     fn suspend(&mut self, tx: SyncSender<()>) {
         self.active.store(false, Ordering::SeqCst);
-        self.render_request_pending.store(false, Ordering::Release);
+        self.clear_render_request_pending();
         let _ = self.compositor.take();
 
         match std::mem::replace(&mut self.state, QueueState::Idle) {
@@ -878,7 +889,7 @@ impl SurfaceThreadState {
     }
 
     fn resume(&mut self, compositor: GbmDrmOutput) {
-        self.render_request_pending.store(false, Ordering::Release);
+        self.clear_render_request_pending();
         let (mode, min_hz) = compositor.with_compositor(|c| {
             (
                 c.surface().pending_mode(),
@@ -935,19 +946,24 @@ impl SurfaceThreadState {
 
     #[profiling::function]
     fn on_vblank(&mut self, metadata: Option<DrmEventMetadata>) {
-        let Some(compositor) = self.compositor.as_mut() else {
+        if self.compositor.is_none() {
             return;
-        };
+        }
 
         // handle edge-cases right after resume
         if !matches!(
             self.state,
             QueueState::WaitingForVBlank { .. } | QueueState::Idle
         ) {
-            match mem::replace(&mut self.state, QueueState::Idle) {
+            let dropped_queued_redraw = match mem::replace(&mut self.state, QueueState::Idle) {
                 QueueState::WaitingForVBlank { .. } | QueueState::Idle => unreachable!(),
-                QueueState::Queued(token) | QueueState::WaitingForEstimatedVBlank(token) => {
+                QueueState::Queued(token) => {
                     self.loop_handle.remove(token);
+                    true
+                }
+                QueueState::WaitingForEstimatedVBlank(token) => {
+                    self.loop_handle.remove(token);
+                    false
                 }
                 QueueState::WaitingForEstimatedVBlankAndQueued {
                     estimated_vblank,
@@ -955,12 +971,21 @@ impl SurfaceThreadState {
                 } => {
                     self.loop_handle.remove(estimated_vblank);
                     self.loop_handle.remove(queued_render);
+                    true
                 }
+            };
+            self.clear_render_request_pending();
+            if dropped_queued_redraw {
+                self.queue_redraw(false);
             }
         }
         if matches!(self.state, QueueState::Idle) {
             return;
         }
+
+        let Some(compositor) = self.compositor.as_mut() else {
+            return;
+        };
 
         let now = self.clock.now();
         let presentation_time = match metadata.as_ref().map(|data| &data.time) {
@@ -1200,7 +1225,7 @@ impl SurfaceThreadState {
     #[profiling::function]
     fn redraw(&mut self, estimated_presentation: Duration) -> Result<()> {
         // Accept one new future redraw request while we work on the currently queued one.
-        self.render_request_pending.store(false, Ordering::Release);
+        self.clear_render_request_pending();
 
         let Some(compositor) = self.compositor.as_mut() else {
             return Ok(());

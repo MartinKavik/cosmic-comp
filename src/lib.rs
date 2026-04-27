@@ -508,10 +508,13 @@ fn refresh(state: &mut State) {
         return;
     }
 
-    if matches!(state.last_refresh, LastRefresh::At(instant) if Instant::now().duration_since(instant) < Duration::from_millis(150))
+    let now = Instant::now();
+    let interval = Duration::from_millis(150);
+    if let LastRefresh::At(instant) = state.last_refresh
+        && let Some(remaining) = interval.checked_sub(now.duration_since(instant))
     {
         if let Ok(token) = state.common.event_loop_handle.insert_source(
-            Timer::from_duration(Duration::from_millis(150)),
+            Timer::from_duration(remaining),
             |_, _, state| {
                 state.last_refresh = LastRefresh::None;
                 TimeoutAction::Drop

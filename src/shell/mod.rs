@@ -337,7 +337,8 @@ impl OverloadTracker {
         let visible_schedules = self.visible_schedules;
         let layer_schedules = self.layer_schedules;
         let visible_budget_skips = self.visible_budget_skips;
-        let visible_pressure = self.visible_schedules + self.visible_budget_skips;
+        let visible_skip_pressure = visible_budget_skips.min(visible_schedules.saturating_mul(2));
+        let visible_pressure = visible_schedules + visible_skip_pressure;
         let avg_commit_us = if commits == 0 {
             0
         } else {
@@ -352,15 +353,22 @@ impl OverloadTracker {
         };
         let max_main_loop_us = self.main_loop_us_max;
 
+        let commit_cost_soft_signal = avg_commit_us >= 800
+            || max_commit_us >= 4000
+            || avg_main_loop_us >= 2000
+            || max_main_loop_us >= 8000;
+        let visible_hard_signal = visible_pressure >= 80 && commit_cost_soft_signal;
+        let visible_medium_signal = visible_pressure >= 65 && commit_cost_soft_signal;
+
         let severe_hard_signal = commits >= 140
-            || visible_pressure >= 80
+            || visible_hard_signal
             || avg_commit_us >= 2200
             || max_commit_us >= 10000
             || avg_main_loop_us >= 8000
             || max_main_loop_us >= 25000;
         let hard_signal = severe_hard_signal
             || commits >= 110
-            || visible_pressure >= 65
+            || visible_medium_signal
             || avg_commit_us >= 1800
             || max_commit_us >= 8000
             || avg_main_loop_us >= 4000
@@ -1013,6 +1021,136 @@ pub struct SessionLock {
 
 static PENDING_RESIZE_COMMIT_WINDOWS: LazyLock<Mutex<HashSet<CosmicMappedKey>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+static COMMON_REFRESH_STATS: LazyLock<Mutex<CommonRefreshStats>> =
+    LazyLock::new(|| Mutex::new(CommonRefreshStats::default()));
+
+#[derive(Default)]
+struct CommonRefreshCounters {
+    calls: u64,
+    total_us_total: u64,
+    total_us_max: u64,
+    activation_us_total: u64,
+    activation_us_max: u64,
+    shell_us_total: u64,
+    shell_us_max: u64,
+    popups_us_total: u64,
+    popups_us_max: u64,
+    toplevel_info_us_total: u64,
+    toplevel_info_us_max: u64,
+    idle_inhibit_us_total: u64,
+    idle_inhibit_us_max: u64,
+    a11y_keyboard_us_total: u64,
+    a11y_keyboard_us_max: u64,
+    capture_cleanup_us_total: u64,
+    capture_cleanup_us_max: u64,
+}
+
+struct CommonRefreshStats {
+    last_log: Instant,
+    counters: CommonRefreshCounters,
+}
+
+impl Default for CommonRefreshStats {
+    fn default() -> Self {
+        Self {
+            last_log: Instant::now(),
+            counters: CommonRefreshCounters::default(),
+        }
+    }
+}
+
+struct CommonRefreshSample {
+    total: Duration,
+    activation: Duration,
+    shell: Duration,
+    popups: Duration,
+    toplevel_info: Duration,
+    idle_inhibit: Duration,
+    a11y_keyboard: Duration,
+    capture_cleanup: Duration,
+}
+
+fn common_refresh_duration_us(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn note_common_refresh_sample(sample: CommonRefreshSample) {
+    let mut stats = COMMON_REFRESH_STATS.lock().unwrap();
+    let counters = &mut stats.counters;
+
+    counters.calls = counters.calls.saturating_add(1);
+
+    let total_us = common_refresh_duration_us(sample.total);
+    counters.total_us_total = counters.total_us_total.saturating_add(total_us);
+    counters.total_us_max = counters.total_us_max.max(total_us);
+
+    let activation_us = common_refresh_duration_us(sample.activation);
+    counters.activation_us_total = counters.activation_us_total.saturating_add(activation_us);
+    counters.activation_us_max = counters.activation_us_max.max(activation_us);
+
+    let shell_us = common_refresh_duration_us(sample.shell);
+    counters.shell_us_total = counters.shell_us_total.saturating_add(shell_us);
+    counters.shell_us_max = counters.shell_us_max.max(shell_us);
+
+    let popups_us = common_refresh_duration_us(sample.popups);
+    counters.popups_us_total = counters.popups_us_total.saturating_add(popups_us);
+    counters.popups_us_max = counters.popups_us_max.max(popups_us);
+
+    let toplevel_info_us = common_refresh_duration_us(sample.toplevel_info);
+    counters.toplevel_info_us_total = counters
+        .toplevel_info_us_total
+        .saturating_add(toplevel_info_us);
+    counters.toplevel_info_us_max = counters.toplevel_info_us_max.max(toplevel_info_us);
+
+    let idle_inhibit_us = common_refresh_duration_us(sample.idle_inhibit);
+    counters.idle_inhibit_us_total = counters
+        .idle_inhibit_us_total
+        .saturating_add(idle_inhibit_us);
+    counters.idle_inhibit_us_max = counters.idle_inhibit_us_max.max(idle_inhibit_us);
+
+    let a11y_keyboard_us = common_refresh_duration_us(sample.a11y_keyboard);
+    counters.a11y_keyboard_us_total = counters
+        .a11y_keyboard_us_total
+        .saturating_add(a11y_keyboard_us);
+    counters.a11y_keyboard_us_max = counters.a11y_keyboard_us_max.max(a11y_keyboard_us);
+
+    let capture_cleanup_us = common_refresh_duration_us(sample.capture_cleanup);
+    counters.capture_cleanup_us_total = counters
+        .capture_cleanup_us_total
+        .saturating_add(capture_cleanup_us);
+    counters.capture_cleanup_us_max = counters.capture_cleanup_us_max.max(capture_cleanup_us);
+
+    if stats.last_log.elapsed() < Duration::from_secs(60) {
+        return;
+    }
+
+    let counters = std::mem::take(&mut stats.counters);
+    stats.last_log = Instant::now();
+    std::mem::drop(stats);
+
+    let avg = |total: u64, calls: u64| if calls == 0 { 0 } else { total / calls };
+
+    warn!(
+        refresh_calls = counters.calls,
+        refresh_total_us_avg = avg(counters.total_us_total, counters.calls),
+        refresh_total_us_max = counters.total_us_max,
+        refresh_activation_us_avg = avg(counters.activation_us_total, counters.calls),
+        refresh_activation_us_max = counters.activation_us_max,
+        refresh_shell_us_avg = avg(counters.shell_us_total, counters.calls),
+        refresh_shell_us_max = counters.shell_us_max,
+        refresh_popups_us_avg = avg(counters.popups_us_total, counters.calls),
+        refresh_popups_us_max = counters.popups_us_max,
+        refresh_toplevel_info_us_avg = avg(counters.toplevel_info_us_total, counters.calls),
+        refresh_toplevel_info_us_max = counters.toplevel_info_us_max,
+        refresh_idle_inhibit_us_avg = avg(counters.idle_inhibit_us_total, counters.calls),
+        refresh_idle_inhibit_us_max = counters.idle_inhibit_us_max,
+        refresh_a11y_keyboard_us_avg = avg(counters.a11y_keyboard_us_total, counters.calls),
+        refresh_a11y_keyboard_us_max = counters.a11y_keyboard_us_max,
+        refresh_capture_cleanup_us_avg = avg(counters.capture_cleanup_us_total, counters.calls),
+        refresh_capture_cleanup_us_max = counters.capture_cleanup_us_max,
+        "[perf] common refresh stats"
+    );
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum WorkspaceDelta {
@@ -2206,17 +2344,50 @@ impl Common {
 
     #[profiling::function]
     pub fn refresh(&mut self) {
+        let total_start = Instant::now();
+
+        let activation_start = Instant::now();
         self.xdg_activation_state
             .retain_tokens(|_, data| data.timestamp.elapsed() < ACTIVATION_TOKEN_EXPIRE_TIME);
+        let activation_elapsed = activation_start.elapsed();
+
+        let shell_start = Instant::now();
         self.shell.write().refresh(
             &self.xdg_activation_state,
             &mut self.workspace_state.update(),
         );
+        let shell_elapsed = shell_start.elapsed();
+
+        let popups_start = Instant::now();
         self.popups.cleanup();
+        let popups_elapsed = popups_start.elapsed();
+
+        let toplevel_info_start = Instant::now();
         self.toplevel_info_state.refresh(&self.workspace_state);
+        let toplevel_info_elapsed = toplevel_info_start.elapsed();
+
+        let idle_inhibit_start = Instant::now();
         self.refresh_idle_inhibit();
+        let idle_inhibit_elapsed = idle_inhibit_start.elapsed();
+
+        let a11y_keyboard_start = Instant::now();
         self.a11y_keyboard_monitor_state.refresh();
+        let a11y_keyboard_elapsed = a11y_keyboard_start.elapsed();
+
+        let capture_cleanup_start = Instant::now();
         self.image_copy_capture_state.cleanup();
+        let capture_cleanup_elapsed = capture_cleanup_start.elapsed();
+
+        note_common_refresh_sample(CommonRefreshSample {
+            total: total_start.elapsed(),
+            activation: activation_elapsed,
+            shell: shell_elapsed,
+            popups: popups_elapsed,
+            toplevel_info: toplevel_info_elapsed,
+            idle_inhibit: idle_inhibit_elapsed,
+            a11y_keyboard: a11y_keyboard_elapsed,
+            capture_cleanup: capture_cleanup_elapsed,
+        });
     }
 
     pub fn refresh_idle_inhibit(&mut self) {
@@ -3187,14 +3358,17 @@ impl Shell {
             return CommitScheduleDecision::Visible;
         }
 
-        if !self.allow_client_output_visible_schedule(pid, output, overload_level, now) {
+        let force_surface_liveness = saturated && overdue;
+
+        if !force_surface_liveness
+            && !self.allow_client_output_visible_schedule(pid, output, overload_level, now)
+        {
             with_surface_commit_lookup_cache(surface, |cache| {
                 cache.visible_schedule.lock().unwrap().skipped_since_allowed += 1;
             });
             return CommitScheduleDecision::VisibleBudgetSkipped;
         }
 
-        let force_surface_liveness = saturated && overdue;
         if !force_surface_liveness && !self.allow_client_visible_schedule(pid, overload_level, now)
         {
             with_surface_commit_lookup_cache(surface, |cache| {
@@ -3940,13 +4114,13 @@ impl Shell {
         output
     }
 
-    fn top_level_layer_surface_for_commit<'a>(
+    fn layer_surface_for_commit<'a>(
         &'a self,
         surface: &WlSurface,
         output: &'a Output,
     ) -> Option<LayerSurface> {
         layer_map_for_output(output)
-            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+            .layer_for_surface(surface, WindowSurfaceType::ALL)
             .cloned()
     }
 
@@ -3961,7 +4135,7 @@ impl Shell {
             OverloadLevel::Hard => Duration::from_millis(50),
         };
 
-        let Some(layer_surface) = self.top_level_layer_surface_for_commit(surface, output) else {
+        let Some(layer_surface) = self.layer_surface_for_commit(surface, output) else {
             return true;
         };
 
@@ -3998,7 +4172,7 @@ impl Shell {
         const UNCHANGED_BURST_LIMIT: u32 = 8;
         const BACKOFF_DURATION: Duration = Duration::from_millis(250);
 
-        let Some(layer_surface) = self.top_level_layer_surface_for_commit(surface, output) else {
+        let Some(layer_surface) = self.layer_surface_for_commit(surface, output) else {
             self.note_commit_layer_arrange_skipped_unchanged();
             return false;
         };

@@ -633,7 +633,7 @@ impl KmsState {
         let now = Instant::now();
         if matches!(scope, InputRedrawScope::Broad)
             && overload_level != OverloadLevel::Normal
-            && self.output_render_request_pending(output)
+            && self.all_output_render_requests_pending(output)
         {
             self.input_redraw_stats.schedule_throttled += 1;
             self.input_redraw_stats.broad_schedule_throttled += 1;
@@ -674,12 +674,21 @@ impl KmsState {
         self.maybe_log_input_redraw_stats();
     }
 
-    fn output_render_request_pending(&self, output: &Output) -> bool {
-        self.drm_devices
+    fn all_output_render_requests_pending(&self, output: &Output) -> bool {
+        let mut saw_target = false;
+        for surface in self
+            .drm_devices
             .values()
             .flat_map(|d| d.inner.surfaces.values())
             .filter(|s| s.output == *output || s.output.mirroring().is_some_and(|o| &o == output))
-            .any(|surface| surface.render_request_pending())
+        {
+            saw_target = true;
+            if !surface.render_request_pending() {
+                return false;
+            }
+        }
+
+        saw_target
     }
 
     fn maybe_log_input_redraw_stats(&mut self) {
