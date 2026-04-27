@@ -17,9 +17,11 @@ use smithay::{
     },
     output::Output,
     wayland::image_copy_capture::{
-        CursorSession, CursorSessionRef, Frame, FrameRef, Session, SessionRef,
+        CaptureFailureReason, CursorSession, CursorSessionRef, Frame, FrameRef, Session,
+        SessionRef,
     },
 };
+use tracing::warn;
 
 use smithay::utils::user_data::UserDataMap;
 
@@ -54,10 +56,80 @@ pub struct ImageCopySessions {
 }
 
 const CAPTURE_ACTIVE_TIMEOUT_MS: u64 = 1_000;
+const MAX_PENDING_FRAMES_PER_OUTPUT: usize = 8;
+const MAX_PENDING_FRAMES_PER_SESSION: usize = 1;
 static MONOTONIC_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+static CAPTURE_QUEUE_STATS: LazyLock<Mutex<CaptureQueueStats>> =
+    LazyLock::new(|| Mutex::new(CaptureQueueStats::default()));
+
+#[derive(Debug)]
+struct CaptureQueueStats {
+    last_log: Instant,
+    queued: u64,
+    taken: u64,
+    dropped_session_cap: u64,
+    dropped_output_cap: u64,
+    max_pending_after_push: usize,
+}
+
+impl Default for CaptureQueueStats {
+    fn default() -> Self {
+        Self {
+            last_log: Instant::now(),
+            queued: 0,
+            taken: 0,
+            dropped_session_cap: 0,
+            dropped_output_cap: 0,
+            max_pending_after_push: 0,
+        }
+    }
+}
 
 fn current_time_ms() -> u64 {
     MONOTONIC_EPOCH.elapsed().as_millis() as u64
+}
+
+fn note_capture_queue(
+    queued: u64,
+    taken: u64,
+    dropped_session_cap: u64,
+    dropped_output_cap: u64,
+    pending_after_push: usize,
+) {
+    let mut stats = CAPTURE_QUEUE_STATS.lock().unwrap();
+    stats.queued = stats.queued.saturating_add(queued);
+    stats.taken = stats.taken.saturating_add(taken);
+    stats.dropped_session_cap = stats
+        .dropped_session_cap
+        .saturating_add(dropped_session_cap);
+    stats.dropped_output_cap = stats.dropped_output_cap.saturating_add(dropped_output_cap);
+    stats.max_pending_after_push = stats.max_pending_after_push.max(pending_after_push);
+
+    if stats.last_log.elapsed() < std::time::Duration::from_secs(60) {
+        return;
+    }
+
+    let queued = stats.queued;
+    let taken = stats.taken;
+    let dropped_session_cap = stats.dropped_session_cap;
+    let dropped_output_cap = stats.dropped_output_cap;
+    let max_pending_after_push = stats.max_pending_after_push;
+    stats.queued = 0;
+    stats.taken = 0;
+    stats.dropped_session_cap = 0;
+    stats.dropped_output_cap = 0;
+    stats.max_pending_after_push = 0;
+    stats.last_log = Instant::now();
+    std::mem::drop(stats);
+
+    warn!(
+        queued,
+        taken,
+        dropped_session_cap,
+        dropped_output_cap,
+        max_pending_after_push,
+        "[perf] capture queue stats"
+    );
 }
 
 impl ImageCopySessions {
@@ -195,7 +267,34 @@ impl FrameHolder for Output {
             .lock()
             .unwrap();
         let was_empty = pending.is_empty();
+
+        let mut dropped_session_cap = 0;
+        while pending
+            .iter()
+            .filter(|(queued_session, _)| queued_session == &session)
+            .count()
+            >= MAX_PENDING_FRAMES_PER_SESSION
+        {
+            let Some(index) = pending
+                .iter()
+                .position(|(queued_session, _)| queued_session == &session)
+            else {
+                break;
+            };
+            let (_, dropped_frame) = pending.remove(index);
+            dropped_frame.fail(CaptureFailureReason::Unknown);
+            dropped_session_cap += 1;
+        }
+
+        let mut dropped_output_cap = 0;
+        while pending.len() >= MAX_PENDING_FRAMES_PER_OUTPUT {
+            let (_, dropped_frame) = pending.remove(0);
+            dropped_frame.fail(CaptureFailureReason::Unknown);
+            dropped_output_cap += 1;
+        }
+
         pending.push((session, frame));
+        note_capture_queue(1, 0, dropped_session_cap, dropped_output_cap, pending.len());
         was_empty
     }
     fn remove_frame(&mut self, frame: &FrameRef) {
@@ -204,10 +303,13 @@ impl FrameHolder for Output {
         }
     }
     fn take_pending_frames(&self) -> Vec<(SessionRef, Frame)> {
-        self.user_data()
+        let frames = self
+            .user_data()
             .get::<PendingImageCopyBuffers>()
             .map(|pending| std::mem::take(&mut *pending.lock().unwrap()))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        note_capture_queue(0, frames.len() as u64, 0, 0, 0);
+        frames
     }
 }
 

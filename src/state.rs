@@ -10,7 +10,7 @@ use crate::{
     config::{CompOutputConfig, Config, ScreenFilter},
     dbus::a11y_keyboard_monitor::A11yKeyboardMonitorState,
     input::{PointerFocusState, gestures::GestureState},
-    shell::{CosmicSurface, SeatExt, Shell, grabs::SeatMoveGrabState},
+    shell::{CosmicSurface, OverloadLevel, SeatExt, Shell, grabs::SeatMoveGrabState},
     utils::prelude::OutputExt,
     wayland::{
         handlers::{data_device::get_dnd_icon, image_copy_capture::SessionHolder},
@@ -1290,15 +1290,22 @@ impl Common {
         // callback pressure that kept the compositor busy on multi-display setups.
         const SCREENCOPY_THROTTLE: Option<Duration> = Some(Duration::from_nanos(33_333_333));
 
-        fn throttle(session_holder: &impl SessionHolder) -> Option<Duration> {
+        fn throttle(
+            session_holder: &impl SessionHolder,
+            overload_level: OverloadLevel,
+        ) -> Option<Duration> {
             if session_holder.is_capture_active() {
-                SCREENCOPY_THROTTLE
+                match overload_level {
+                    OverloadLevel::Hard => Some(Duration::from_millis(50)),
+                    OverloadLevel::Normal | OverloadLevel::Soft => SCREENCOPY_THROTTLE,
+                }
             } else {
                 THROTTLE
             }
         }
 
         let shell = self.shell.read();
+        let overload_level = shell.overload_level();
 
         if let Some(session_lock) = shell.session_lock.as_ref()
             && let Some(lock_surface) = session_lock.surfaces.get(output)
@@ -1327,7 +1334,7 @@ impl Common {
                 && let Some(grab_state) = move_grab.lock().unwrap().as_ref()
             {
                 for (window, _) in grab_state.element().windows() {
-                    window.send_frame(output, time, throttle(&window), should_send);
+                    window.send_frame(output, time, throttle(&window, overload_level), should_send);
                 }
             }
 
@@ -1351,24 +1358,24 @@ impl Common {
             .mapped()
             .for_each(|mapped| {
                 for (window, _) in mapped.windows() {
-                    window.send_frame(output, time, throttle(&window), should_send);
+                    window.send_frame(output, time, throttle(&window, overload_level), should_send);
                 }
             });
 
         if let Some(active) = shell.active_space(output) {
             if let Some(window) = active.get_fullscreen() {
-                window.send_frame(output, time, throttle(window), should_send);
+                window.send_frame(output, time, throttle(window, overload_level), should_send);
             }
             active.mapped().for_each(|mapped| {
                 for (window, _) in mapped.windows() {
-                    window.send_frame(output, time, throttle(&window), should_send);
+                    window.send_frame(output, time, throttle(&window, overload_level), should_send);
                 }
             });
 
             // other (throttled) windows
             active.minimized_windows.iter().for_each(|m| {
                 for window in m.windows() {
-                    window.send_frame(output, time, throttle(&window), |_, _| None);
+                    window.send_frame(output, time, throttle(&window, overload_level), |_, _| None);
                 }
             });
 
@@ -1378,18 +1385,24 @@ impl Common {
                 .filter(|w| w.handle != active.handle)
             {
                 if let Some(window) = space.get_fullscreen() {
-                    let throttle = min(throttle(space), throttle(window));
+                    let throttle = min(
+                        throttle(space, overload_level),
+                        throttle(window, overload_level),
+                    );
                     window.send_frame(output, time, throttle, |_, _| None);
                 }
                 space.mapped().for_each(|mapped| {
                     for (window, _) in mapped.windows() {
-                        let throttle = min(throttle(space), throttle(&window));
+                        let throttle = min(
+                            throttle(space, overload_level),
+                            throttle(&window, overload_level),
+                        );
                         window.send_frame(output, time, throttle, |_, _| None);
                     }
                 });
                 space.minimized_windows.iter().for_each(|m| {
                     for window in m.windows() {
-                        window.send_frame(output, time, throttle(&window), |_, _| None);
+                        window.send_frame(output, time, throttle(&window, overload_level), |_, _| None);
                     }
                 })
             }
