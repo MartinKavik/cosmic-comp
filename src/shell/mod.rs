@@ -180,6 +180,18 @@ struct ClientVisibleBudgetState {
     scheduled_in_window: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ClientOutputBudgetKey {
+    pid: i32,
+    output_name: String,
+}
+
+#[derive(Debug, Default)]
+struct ClientOutputVisibleBudgetState {
+    last_seen: Option<Instant>,
+    last_scheduled: Option<Instant>,
+}
+
 #[derive(Debug, Default)]
 struct CommitAttributionCounters {
     commits: u64,
@@ -506,6 +518,7 @@ struct LayerCommitGuardState {
     unchanged_window_start: Option<Instant>,
     unchanged_burst: u32,
     backoff_until: Option<Instant>,
+    last_render_at: Option<Instant>,
 }
 
 impl LayerLayoutKey {
@@ -674,6 +687,8 @@ struct SurfaceLookupCounters {
     commit_schedule_visible_backoff_skips: u64,
     commit_schedule_visible_backoff_soft_hits: u64,
     commit_schedule_client_budget_skips: u64,
+    commit_schedule_client_output_budget_skips: u64,
+    commit_schedule_layer_render_skips: u64,
     commit_layer_arrange_changed: u64,
     commit_layer_arrange_unchanged: u64,
     commit_layer_arrange_skipped_unchanged: u64,
@@ -961,6 +976,7 @@ pub struct Shell {
     commit_attribution_stats: Mutex<CommitAttributionStats>,
     overload_tracker: Mutex<OverloadTracker>,
     client_visible_budgets: Mutex<HashMap<i32, ClientVisibleBudgetState>>,
+    client_output_visible_budgets: Mutex<HashMap<ClientOutputBudgetKey, ClientOutputVisibleBudgetState>>,
 
     theme: cosmic::Theme,
     pub active_hint: bool,
@@ -2295,6 +2311,7 @@ impl Shell {
             commit_attribution_stats: Mutex::new(CommitAttributionStats::default()),
             overload_tracker: Mutex::new(OverloadTracker::default()),
             client_visible_budgets: Mutex::new(HashMap::new()),
+            client_output_visible_budgets: Mutex::new(HashMap::new()),
 
             theme,
             active_hint: config.cosmic_conf.active_hint,
@@ -2640,6 +2657,10 @@ impl Shell {
                     counters.commit_schedule_visible_backoff_soft_hits,
                 commit_schedule_client_budget_skips =
                     counters.commit_schedule_client_budget_skips,
+                commit_schedule_client_output_budget_skips =
+                    counters.commit_schedule_client_output_budget_skips,
+                commit_schedule_layer_render_skips =
+                    counters.commit_schedule_layer_render_skips,
                 commit_layer_arrange_changed = counters.commit_layer_arrange_changed,
                 commit_layer_arrange_unchanged = counters.commit_layer_arrange_unchanged,
                 commit_layer_arrange_skipped_unchanged =
@@ -2738,6 +2759,16 @@ impl Shell {
 
     pub fn note_commit_schedule_client_budget_skip(&self) {
         self.note_surface_lookup_stats(|stats| stats.commit_schedule_client_budget_skips += 1);
+    }
+
+    pub fn note_commit_schedule_client_output_budget_skip(&self) {
+        self.note_surface_lookup_stats(|stats| {
+            stats.commit_schedule_client_output_budget_skips += 1
+        });
+    }
+
+    pub fn note_commit_schedule_layer_render_skip(&self) {
+        self.note_surface_lookup_stats(|stats| stats.commit_schedule_layer_render_skips += 1);
     }
 
     pub fn note_commit_layer_arrange(&self, changed: bool) {
@@ -2898,6 +2929,8 @@ impl Shell {
                 current_window_main_loop_us_max = snapshot.current_window_main_loop_us_max,
                 surface_index_entries = self.surface_index.lock().unwrap().len(),
                 client_visible_budget_entries = self.client_visible_budgets.lock().unwrap().len(),
+                client_output_visible_budget_entries =
+                    self.client_output_visible_budgets.lock().unwrap().len(),
                 "[perf] overload residency stats"
             );
         }
@@ -2943,6 +2976,52 @@ impl Shell {
         }
 
         budget.scheduled_in_window += 1;
+        true
+    }
+
+    fn allow_client_output_visible_schedule(
+        &self,
+        pid: Option<i32>,
+        output: &Output,
+        level: OverloadLevel,
+        now: Instant,
+    ) -> bool {
+        let Some(pid) = pid else {
+            return true;
+        };
+
+        let min_interval = match level {
+            OverloadLevel::Normal => return true,
+            OverloadLevel::Soft => Duration::from_millis(24),
+            OverloadLevel::Hard => Duration::from_millis(33),
+        };
+
+        let mut budgets = self.client_output_visible_budgets.lock().unwrap();
+        if budgets.len() > 512 {
+            budgets.retain(|_, budget| {
+                budget
+                    .last_seen
+                    .is_some_and(|last_seen| now.duration_since(last_seen) < Duration::from_secs(300))
+            });
+        }
+
+        let budget = budgets
+            .entry(ClientOutputBudgetKey {
+                pid,
+                output_name: output.name(),
+            })
+            .or_default();
+        budget.last_seen = Some(now);
+
+        if budget
+            .last_scheduled
+            .is_some_and(|last| now.duration_since(last) < min_interval)
+        {
+            self.note_commit_schedule_client_output_budget_skip();
+            return false;
+        }
+
+        budget.last_scheduled = Some(now);
         true
     }
 
@@ -3056,20 +3135,45 @@ impl Shell {
             return CommitScheduleDecision::VisibleBudgetSkipped;
         }
 
-        let force_surface_liveness = saturated && overdue;
-        if overload_level == OverloadLevel::Normal
-            || force_surface_liveness
-            || self.allow_client_visible_schedule(pid, overload_level, now)
-        {
+        if overload_level == OverloadLevel::Normal {
             with_surface_commit_lookup_cache(surface, |cache| {
                 let mut state = cache.visible_schedule.lock().unwrap();
                 state.last_allowed = Some(now);
                 state.skipped_since_allowed = 0;
             });
-            CommitScheduleDecision::Visible
-        } else {
-            CommitScheduleDecision::VisibleBudgetSkipped
+            return CommitScheduleDecision::Visible;
         }
+
+        if !self.allow_client_output_visible_schedule(pid, output, overload_level, now) {
+            with_surface_commit_lookup_cache(surface, |cache| {
+                cache
+                    .visible_schedule
+                    .lock()
+                    .unwrap()
+                    .skipped_since_allowed += 1;
+            });
+            return CommitScheduleDecision::VisibleBudgetSkipped;
+        }
+
+        let force_surface_liveness = saturated && overdue;
+        if !force_surface_liveness && !self.allow_client_visible_schedule(pid, overload_level, now)
+        {
+            with_surface_commit_lookup_cache(surface, |cache| {
+                cache
+                    .visible_schedule
+                    .lock()
+                    .unwrap()
+                    .skipped_since_allowed += 1;
+            });
+            return CommitScheduleDecision::VisibleBudgetSkipped;
+        }
+
+        with_surface_commit_lookup_cache(surface, |cache| {
+            let mut state = cache.visible_schedule.lock().unwrap();
+            state.last_allowed = Some(now);
+            state.skipped_since_allowed = 0;
+        });
+        CommitScheduleDecision::Visible
     }
 
     fn allow_surface_lookup_fallback(
@@ -3814,6 +3918,45 @@ impl Shell {
         layer_map_for_output(output)
             .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
             .cloned()
+    }
+
+    pub fn should_schedule_layer_commit_render(&self, surface: &WlSurface, output: &Output) -> bool {
+        let min_interval = match self.overload_level() {
+            OverloadLevel::Normal => return true,
+            OverloadLevel::Soft => Duration::from_millis(33),
+            OverloadLevel::Hard => Duration::from_millis(50),
+        };
+
+        let Some(layer_surface) = self.top_level_layer_surface_for_commit(surface, output) else {
+            return true;
+        };
+
+        let key = LayerLayoutKey::from_layer_surface(output, &layer_surface);
+        let root_id = layer_surface.wl_surface().id();
+        let now = Instant::now();
+        let mut guards = self.layer_commit_guards.lock().unwrap();
+        let guard = guards.entry(root_id).or_default();
+
+        let changed = guard
+            .last_layout_key
+            .as_ref()
+            .map(|last| last != &key)
+            .unwrap_or(true);
+        if changed {
+            guard.last_render_at = Some(now);
+            return true;
+        }
+
+        if guard
+            .last_render_at
+            .is_some_and(|last| now.duration_since(last) < min_interval)
+        {
+            self.note_commit_schedule_layer_render_skip();
+            return false;
+        }
+
+        guard.last_render_at = Some(now);
+        true
     }
 
     pub fn should_arrange_layer_commit(&self, surface: &WlSurface, output: &Output) -> bool {

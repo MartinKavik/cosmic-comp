@@ -303,11 +303,14 @@ impl CompositorHandler for State {
             visible_schedule_decision.unwrap_or(CommitScheduleDecision::Miss)
         };
 
-        if let Some(output) = layer_output
+        let layer_schedule_output = layer_output
             .as_ref()
-            .or(matches!(schedule_decision, CommitScheduleDecision::Visible)
-                .then_some(visible_output.as_ref())
-                .flatten())
+            .filter(|output| shell.should_schedule_layer_commit_render(surface, output));
+        if let Some(output) =
+            layer_schedule_output
+                .or(matches!(schedule_decision, CommitScheduleDecision::Visible)
+                    .then_some(visible_output.as_ref())
+                    .flatten())
         {
             self.backend.schedule_render(output);
         }
