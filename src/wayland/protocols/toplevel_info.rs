@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::HashSet,
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use smithay::{
     output::Output,
@@ -27,7 +31,7 @@ use cosmic_protocols::toplevel_info::v1::server::{
     zcosmic_toplevel_handle_v1::{self, State as States, ZcosmicToplevelHandleV1},
     zcosmic_toplevel_info_v1::{self, ZcosmicToplevelInfoV1},
 };
-use tracing::error;
+use tracing::{error, warn};
 
 pub trait Window: IsAlive + Clone + PartialEq + Send {
     /// A weak reference type that does not keep the window alive.
@@ -59,6 +63,12 @@ pub struct ToplevelInfoState<D, W: Window> {
     instances: Vec<ZcosmicToplevelInfoV1>,
     dirty: bool,
     last_dirty: bool,
+    pending_refresh: bool,
+    full_sweep_pending: bool,
+    last_full_sweep: Option<Instant>,
+    refresh_cursor: usize,
+    refresh_stats: ToplevelRefreshStats,
+    last_stats_log: Option<Instant>,
     pub(in crate::wayland) foreign_toplevel_list: ForeignToplevelListState,
     global: GlobalId,
     _dispatch_data: std::marker::PhantomData<D>,
@@ -74,12 +84,118 @@ pub struct ToplevelInfoGlobalData {
     filter: Box<dyn for<'a> Fn(&'a Client) -> bool + Send + Sync>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ToplevelRefreshBudget {
+    max_pairs: usize,
+    max_elapsed: Duration,
+    full_sweep_interval: Duration,
+    pending_interval: Duration,
+}
+
+impl ToplevelRefreshBudget {
+    pub const fn normal() -> Self {
+        Self {
+            max_pairs: 64,
+            max_elapsed: Duration::from_millis(4),
+            full_sweep_interval: Duration::from_secs(10),
+            pending_interval: Duration::ZERO,
+        }
+    }
+
+    pub const fn soft() -> Self {
+        Self {
+            max_pairs: 24,
+            max_elapsed: Duration::from_millis(2),
+            full_sweep_interval: Duration::from_secs(30),
+            pending_interval: Duration::from_millis(150),
+        }
+    }
+
+    pub const fn hard() -> Self {
+        Self {
+            max_pairs: 8,
+            max_elapsed: Duration::from_millis(1),
+            full_sweep_interval: Duration::from_secs(60),
+            pending_interval: Duration::from_millis(250),
+        }
+    }
+
+    pub const fn pending_interval(self) -> Duration {
+        self.pending_interval
+    }
+}
+
+#[derive(Default, Debug)]
+struct ToplevelRefreshStats {
+    calls: u64,
+    elapsed_us_total: u64,
+    elapsed_us_max: u64,
+    windows_scanned: u64,
+    windows_skipped_clean: u64,
+    windows_dirty: u64,
+    instance_pairs: u64,
+    changed_pairs: u64,
+    budget_stops: u64,
+    dead_windows_removed: u64,
+    done_events: u64,
+    full_sweeps: u64,
+}
+
+#[derive(Default)]
+struct ToplevelRefreshSample {
+    elapsed: Duration,
+    windows_scanned: u64,
+    windows_skipped_clean: u64,
+    windows_dirty: u64,
+    instance_pairs: u64,
+    changed_pairs: u64,
+    budget_stops: u64,
+    dead_windows_removed: u64,
+    done_events: u64,
+    full_sweeps: u64,
+}
+
+#[derive(Clone, PartialEq)]
+struct ToplevelSnapshot {
+    title: String,
+    app_id: String,
+    maximized: bool,
+    fullscreen: bool,
+    activated: bool,
+    minimized: bool,
+    sticky: bool,
+    geometry: Option<Rectangle<i32, Global>>,
+    outputs: Vec<Output>,
+    workspaces: Vec<WorkspaceHandle>,
+}
+
+impl ToplevelSnapshot {
+    fn from_window<W: Window>(window: &W, state: &ToplevelStateInner) -> Self {
+        Self {
+            title: window.title(),
+            app_id: window.app_id(),
+            maximized: window.is_maximized(),
+            fullscreen: window.is_fullscreen(),
+            activated: window.is_activated(),
+            minimized: window.is_minimized(),
+            sticky: window.is_sticky(),
+            geometry: (!window.is_resizing())
+                .then(|| window.global_geometry())
+                .flatten(),
+            outputs: state.outputs.clone(),
+            workspaces: state.workspaces.clone(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct ToplevelStateInner {
     foreign_handle: Option<ForeignToplevelHandle>,
     instances: Vec<(Weak<ZcosmicToplevelInfoV1>, ZcosmicToplevelHandleV1)>,
     outputs: Vec<Output>,
     workspaces: Vec<WorkspaceHandle>,
+    snapshot: Option<ToplevelSnapshot>,
+    needs_refresh: bool,
     pub(super) rectangles: Vec<(Weak<WlSurface>, Rectangle<i32, Logical>)>,
 }
 pub(super) type ToplevelState = Mutex<ToplevelStateInner>;
@@ -98,6 +214,10 @@ impl ToplevelStateInner {
 
     pub fn in_workspace(&self, handle: &WorkspaceHandle) -> bool {
         self.workspaces.contains(handle)
+    }
+
+    fn mark_needs_refresh(&mut self) {
+        self.needs_refresh = true;
     }
 }
 
@@ -226,6 +346,9 @@ where
                         .unwrap()
                         .instances
                         .push((obj.downgrade(), instance));
+                    if let Some(state) = window.user_data().get::<ToplevelState>() {
+                        state.lock().unwrap().mark_needs_refresh();
+                    }
                 } else {
                     let _ = data_init.init(cosmic_toplevel, ToplevelHandleStateInner::empty());
                     error!(
@@ -294,25 +417,43 @@ where
 
 pub fn toplevel_enter_output(toplevel: &impl Window, output: &Output) {
     if let Some(state) = toplevel.user_data().get::<ToplevelState>() {
-        state.lock().unwrap().outputs.push(output.clone());
+        let mut state = state.lock().unwrap();
+        if !state.outputs.contains(output) {
+            state.outputs.push(output.clone());
+            state.mark_needs_refresh();
+        }
     }
 }
 
 pub fn toplevel_leave_output(toplevel: &impl Window, output: &Output) {
     if let Some(state) = toplevel.user_data().get::<ToplevelState>() {
-        state.lock().unwrap().outputs.retain(|o| o != output);
+        let mut state = state.lock().unwrap();
+        let old_len = state.outputs.len();
+        state.outputs.retain(|o| o != output);
+        if state.outputs.len() != old_len {
+            state.mark_needs_refresh();
+        }
     }
 }
 
 pub fn toplevel_enter_workspace(toplevel: &impl Window, workspace: &WorkspaceHandle) {
     if let Some(state) = toplevel.user_data().get::<ToplevelState>() {
-        state.lock().unwrap().workspaces.push(*workspace);
+        let mut state = state.lock().unwrap();
+        if !state.workspaces.contains(workspace) {
+            state.workspaces.push(*workspace);
+            state.mark_needs_refresh();
+        }
     }
 }
 
 pub fn toplevel_leave_workspace(toplevel: &impl Window, workspace: &WorkspaceHandle) {
     if let Some(state) = toplevel.user_data().get::<ToplevelState>() {
-        state.lock().unwrap().workspaces.retain(|w| w != workspace);
+        let mut state = state.lock().unwrap();
+        let old_len = state.workspaces.len();
+        state.workspaces.retain(|w| w != workspace);
+        if state.workspaces.len() != old_len {
+            state.mark_needs_refresh();
+        }
     }
 }
 
@@ -344,6 +485,12 @@ where
             instances: Vec::new(),
             dirty: false,
             last_dirty: false,
+            pending_refresh: false,
+            full_sweep_pending: false,
+            last_full_sweep: None,
+            refresh_cursor: 0,
+            refresh_stats: ToplevelRefreshStats::default(),
+            last_stats_log: None,
             foreign_toplevel_list,
             global,
             _dispatch_data: std::marker::PhantomData,
@@ -358,6 +505,7 @@ where
         if let Some(toplevel_state) = toplevel.user_data().get::<ToplevelState>() {
             let mut toplevel_state = toplevel_state.lock().unwrap();
             toplevel_state.foreign_handle = Some(toplevel_handle);
+            toplevel_state.mark_needs_refresh();
         } else {
             toplevel
                 .user_data()
@@ -398,9 +546,109 @@ where
         self.toplevels.retain(|w| w != toplevel);
     }
 
-    pub fn refresh(&mut self, workspace_state: &WorkspaceState<D>) {
+    pub fn has_pending_refresh(&self) -> bool {
+        self.pending_refresh || self.full_sweep_pending
+    }
+
+    pub fn refresh(&mut self, workspace_state: &WorkspaceState<D>, budget: ToplevelRefreshBudget) {
+        let started = Instant::now();
+        let mut sample = ToplevelRefreshSample::default();
         let mut dirty = std::mem::replace(&mut self.dirty, false);
 
+        let new_full_sweep = self.full_sweep_pending
+            || self
+                .last_full_sweep
+                .is_none_or(|last| started.duration_since(last) >= budget.full_sweep_interval);
+        if new_full_sweep && !self.full_sweep_pending {
+            sample.full_sweeps = 1;
+        }
+        self.full_sweep_pending = new_full_sweep;
+
+        self.retain_live_toplevels(&mut dirty, &mut sample);
+        if self.toplevels.is_empty() {
+            self.refresh_cursor = 0;
+            self.pending_refresh = false;
+            self.full_sweep_pending = false;
+            self.last_full_sweep = Some(started);
+            self.finish_refresh(started, dirty, sample);
+            return;
+        }
+
+        let len = self.toplevels.len();
+        let mut pending_refresh = false;
+        let mut sent_pairs = 0usize;
+        let start_index = self.refresh_cursor.min(len.saturating_sub(1));
+        let mut next_cursor = 0usize;
+
+        for offset in 0..len {
+            let idx = (start_index + offset) % len;
+            next_cursor = (idx + 1) % len;
+            let window = &self.toplevels[idx];
+            sample.windows_scanned = sample.windows_scanned.saturating_add(1);
+
+            {
+                let mut state = window
+                    .user_data()
+                    .get::<ToplevelState>()
+                    .unwrap()
+                    .lock()
+                    .unwrap();
+                let snapshot = ToplevelSnapshot::from_window(window, &state);
+                let changed = state.snapshot.as_ref() != Some(&snapshot);
+                let needs_refresh = state.needs_refresh || changed || new_full_sweep;
+                if !needs_refresh {
+                    sample.windows_skipped_clean = sample.windows_skipped_clean.saturating_add(1);
+                    continue;
+                }
+                if budget_exhausted(started, sent_pairs, budget) {
+                    state.mark_needs_refresh();
+                    pending_refresh = true;
+                    sample.budget_stops = sample.budget_stops.saturating_add(1);
+                    next_cursor = idx;
+                    break;
+                }
+                state.snapshot = Some(snapshot);
+                state.needs_refresh = false;
+            }
+            sample.windows_dirty = sample.windows_dirty.saturating_add(1);
+            let mut incomplete_window = false;
+            for instance in &self.instances {
+                if budget_exhausted(started, sent_pairs, budget) {
+                    incomplete_window = true;
+                    break;
+                }
+                let changed =
+                    send_toplevel_to_client::<D, W>(&self.dh, workspace_state, instance, window);
+                sent_pairs = sent_pairs.saturating_add(1);
+                sample.instance_pairs = sample.instance_pairs.saturating_add(1);
+                if changed {
+                    sample.changed_pairs = sample.changed_pairs.saturating_add(1);
+                    dirty = true;
+                }
+            }
+
+            if incomplete_window {
+                if let Some(state) = window.user_data().get::<ToplevelState>() {
+                    state.lock().unwrap().mark_needs_refresh();
+                }
+                pending_refresh = true;
+                sample.budget_stops = sample.budget_stops.saturating_add(1);
+                next_cursor = idx;
+                break;
+            }
+        }
+
+        self.refresh_cursor = if pending_refresh { next_cursor } else { 0 };
+        self.pending_refresh = pending_refresh;
+        if !pending_refresh && new_full_sweep {
+            self.full_sweep_pending = false;
+            self.last_full_sweep = Some(started);
+        }
+
+        self.finish_refresh(started, dirty, sample);
+    }
+
+    fn retain_live_toplevels(&mut self, dirty: &mut bool, sample: &mut ToplevelRefreshSample) {
         self.toplevels.retain(|window| {
             let mut state = window
                 .user_data()
@@ -412,46 +660,115 @@ where
                 .rectangles
                 .retain(|(surface, _)| surface.upgrade().is_ok());
             if window.alive() {
-                std::mem::drop(state);
-                for instance in &self.instances {
-                    let changed = send_toplevel_to_client::<D, W>(
-                        &self.dh,
-                        workspace_state,
-                        instance,
-                        window,
-                    );
-                    dirty = dirty || changed;
-                }
-                true
-            } else {
-                for (_info, handle) in &state.instances {
-                    // don't send events to stopped instances
-                    if handle.version() < zcosmic_toplevel_info_v1::REQ_GET_COSMIC_TOPLEVEL_SINCE
-                        && self
-                            .instances
-                            .iter()
-                            .any(|i| i.id().same_client_as(&handle.id()))
-                    {
-                        handle.closed();
-                    }
-                }
-                // Safety net: drop capture sessions for dead windows
-                // detected during refresh (same reason as remove_toplevel).
-                stop_all_capture_sessions(window.user_data());
-                dirty = true;
-                false
+                return true;
             }
-        });
 
-        if !dirty && self.last_dirty {
+            for (_info, handle) in &state.instances {
+                // don't send events to stopped instances
+                if handle.version() < zcosmic_toplevel_info_v1::REQ_GET_COSMIC_TOPLEVEL_SINCE
+                    && self
+                        .instances
+                        .iter()
+                        .any(|i| i.id().same_client_as(&handle.id()))
+                {
+                    handle.closed();
+                }
+            }
+            stop_all_capture_sessions(window.user_data());
+            *dirty = true;
+            sample.dead_windows_removed = sample.dead_windows_removed.saturating_add(1);
+            false
+        });
+    }
+
+    fn finish_refresh(&mut self, started: Instant, dirty: bool, mut sample: ToplevelRefreshSample) {
+        if !self.pending_refresh && !dirty && self.last_dirty {
             for instance in &self.instances {
                 if instance.version() >= zcosmic_toplevel_info_v1::EVT_DONE_SINCE {
                     instance.done();
+                    sample.done_events = sample.done_events.saturating_add(1);
                 }
             }
         }
 
-        self.last_dirty = dirty;
+        self.last_dirty = dirty || (self.last_dirty && self.pending_refresh);
+        sample.elapsed = started.elapsed();
+        self.note_refresh_sample(sample);
+    }
+
+    fn note_refresh_sample(&mut self, sample: ToplevelRefreshSample) {
+        let elapsed_us = sample.elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.refresh_stats.calls = self.refresh_stats.calls.saturating_add(1);
+        self.refresh_stats.elapsed_us_total = self
+            .refresh_stats
+            .elapsed_us_total
+            .saturating_add(elapsed_us);
+        self.refresh_stats.elapsed_us_max = self.refresh_stats.elapsed_us_max.max(elapsed_us);
+        self.refresh_stats.windows_scanned = self
+            .refresh_stats
+            .windows_scanned
+            .saturating_add(sample.windows_scanned);
+        self.refresh_stats.windows_skipped_clean = self
+            .refresh_stats
+            .windows_skipped_clean
+            .saturating_add(sample.windows_skipped_clean);
+        self.refresh_stats.windows_dirty = self
+            .refresh_stats
+            .windows_dirty
+            .saturating_add(sample.windows_dirty);
+        self.refresh_stats.instance_pairs = self
+            .refresh_stats
+            .instance_pairs
+            .saturating_add(sample.instance_pairs);
+        self.refresh_stats.changed_pairs = self
+            .refresh_stats
+            .changed_pairs
+            .saturating_add(sample.changed_pairs);
+        self.refresh_stats.budget_stops = self
+            .refresh_stats
+            .budget_stops
+            .saturating_add(sample.budget_stops);
+        self.refresh_stats.dead_windows_removed = self
+            .refresh_stats
+            .dead_windows_removed
+            .saturating_add(sample.dead_windows_removed);
+        self.refresh_stats.done_events = self
+            .refresh_stats
+            .done_events
+            .saturating_add(sample.done_events);
+        self.refresh_stats.full_sweeps = self
+            .refresh_stats
+            .full_sweeps
+            .saturating_add(sample.full_sweeps);
+
+        let now = Instant::now();
+        if self
+            .last_stats_log
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(60))
+        {
+            return;
+        }
+
+        let calls = self.refresh_stats.calls.max(1);
+        warn!(
+            toplevel_refresh_calls = self.refresh_stats.calls,
+            toplevel_refresh_elapsed_us_avg = self.refresh_stats.elapsed_us_total / calls,
+            toplevel_refresh_elapsed_us_max = self.refresh_stats.elapsed_us_max,
+            toplevel_refresh_windows_scanned = self.refresh_stats.windows_scanned,
+            toplevel_refresh_windows_skipped_clean = self.refresh_stats.windows_skipped_clean,
+            toplevel_refresh_windows_dirty = self.refresh_stats.windows_dirty,
+            toplevel_refresh_instance_pairs = self.refresh_stats.instance_pairs,
+            toplevel_refresh_changed_pairs = self.refresh_stats.changed_pairs,
+            toplevel_refresh_budget_stops = self.refresh_stats.budget_stops,
+            toplevel_refresh_dead_windows_removed = self.refresh_stats.dead_windows_removed,
+            toplevel_refresh_done_events = self.refresh_stats.done_events,
+            toplevel_refresh_full_sweeps = self.refresh_stats.full_sweeps,
+            toplevel_refresh_pending = self.pending_refresh,
+            toplevel_refresh_full_sweep_pending = self.full_sweep_pending,
+            "[perf] toplevel info refresh stats"
+        );
+        self.refresh_stats = ToplevelRefreshStats::default();
+        self.last_stats_log = Some(now);
     }
 
     pub fn global_id(&self) -> GlobalId {
@@ -651,6 +968,10 @@ where
     }
 
     changed
+}
+
+fn budget_exhausted(started: Instant, sent_pairs: usize, budget: ToplevelRefreshBudget) -> bool {
+    sent_pairs >= budget.max_pairs || (sent_pairs > 0 && started.elapsed() >= budget.max_elapsed)
 }
 
 pub fn window_from_handle<W: Window + 'static>(handle: ZcosmicToplevelHandleV1) -> Option<W> {

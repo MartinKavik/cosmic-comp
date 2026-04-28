@@ -74,8 +74,8 @@ use crate::{
         },
         protocols::{
             toplevel_info::{
-                ToplevelInfoState, toplevel_enter_output, toplevel_enter_workspace,
-                toplevel_leave_output, toplevel_leave_workspace,
+                ToplevelInfoState, ToplevelRefreshBudget, toplevel_enter_output,
+                toplevel_enter_workspace, toplevel_leave_output, toplevel_leave_workspace,
             },
             workspace::{
                 WorkspaceGroupHandle, WorkspaceHandle, WorkspaceState, WorkspaceUpdateGuard,
@@ -1168,11 +1168,28 @@ fn note_common_refresh_sample(sample: CommonRefreshSample) {
     );
 }
 
-fn should_refresh_toplevel_info(overload_level: OverloadLevel, now: Instant) -> bool {
-    let min_interval = match overload_level {
-        OverloadLevel::Normal => Duration::ZERO,
-        OverloadLevel::Soft => Duration::from_millis(750),
-        OverloadLevel::Hard => Duration::from_millis(1500),
+fn toplevel_info_refresh_budget(overload_level: OverloadLevel) -> ToplevelRefreshBudget {
+    match overload_level {
+        OverloadLevel::Normal => ToplevelRefreshBudget::normal(),
+        OverloadLevel::Soft => ToplevelRefreshBudget::soft(),
+        OverloadLevel::Hard => ToplevelRefreshBudget::hard(),
+    }
+}
+
+fn should_refresh_toplevel_info(
+    overload_level: OverloadLevel,
+    now: Instant,
+    pending_refresh: bool,
+) -> bool {
+    let budget = toplevel_info_refresh_budget(overload_level);
+    let min_interval = if pending_refresh {
+        budget.pending_interval()
+    } else {
+        match overload_level {
+            OverloadLevel::Normal => Duration::ZERO,
+            OverloadLevel::Soft => Duration::from_millis(750),
+            OverloadLevel::Hard => Duration::from_millis(1500),
+        }
     };
 
     let mut last = TOPLEVEL_INFO_REFRESH_LAST.lock().unwrap();
@@ -2396,14 +2413,19 @@ impl Common {
         let popups_elapsed = popups_start.elapsed();
 
         let now = Instant::now();
-        let (toplevel_info_refreshed, toplevel_info_elapsed) =
-            if should_refresh_toplevel_info(overload_level, now) {
-                let toplevel_info_start = Instant::now();
-                self.toplevel_info_state.refresh(&self.workspace_state);
-                (true, toplevel_info_start.elapsed())
-            } else {
-                (false, Duration::ZERO)
-            };
+        let (toplevel_info_refreshed, toplevel_info_elapsed) = if should_refresh_toplevel_info(
+            overload_level,
+            now,
+            self.toplevel_info_state.has_pending_refresh(),
+        ) {
+            let budget = toplevel_info_refresh_budget(overload_level);
+            let toplevel_info_start = Instant::now();
+            self.toplevel_info_state
+                .refresh(&self.workspace_state, budget);
+            (true, toplevel_info_start.elapsed())
+        } else {
+            (false, Duration::ZERO)
+        };
 
         let idle_inhibit_start = Instant::now();
         self.refresh_idle_inhibit();
