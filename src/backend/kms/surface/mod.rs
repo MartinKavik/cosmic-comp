@@ -979,7 +979,7 @@ impl SurfaceThreadState {
                 self.queue_redraw(false);
             }
         }
-        if matches!(self.state, QueueState::Idle) {
+        if !matches!(self.state, QueueState::WaitingForVBlank { .. }) {
             return;
         }
 
