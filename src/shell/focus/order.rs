@@ -47,6 +47,12 @@ pub enum Stage<'a> {
         workspace: &'a Workspace,
         offset: Point<i32, Logical>,
     },
+    CrossOutputWorkspacePopups {
+        workspace: &'a Workspace,
+    },
+    CrossOutputWorkspace {
+        workspace: &'a Workspace,
+    },
     Workspace {
         workspace: &'a Workspace,
         offset: Point<i32, Logical>,
@@ -258,6 +264,12 @@ fn render_input_order_internal<R: 'static>(
             workspace,
             offset: current_offset,
         })?;
+
+        if !has_focused_fullscreen {
+            for workspace in shell.cross_output_floating_workspaces(output) {
+                callback(Stage::CrossOutputWorkspacePopups { workspace })?;
+            }
+        }
     }
 
     if !has_focused_fullscreen {
@@ -321,6 +333,12 @@ fn render_input_order_internal<R: 'static>(
     }
 
     if element_filter != ElementFilter::LayerShellOnly {
+        if !has_fullscreen {
+            for workspace in shell.cross_output_floating_workspaces(output) {
+                callback(Stage::CrossOutputWorkspace { workspace })?;
+            }
+        }
+
         // workspace windows
         callback(Stage::Workspace {
             workspace,

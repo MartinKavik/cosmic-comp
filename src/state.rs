@@ -1194,6 +1194,33 @@ impl Common {
                 }
             });
         }
+        for workspace in shell.cross_output_floating_workspaces(output) {
+            workspace.floating_layer.mapped().for_each(|mapped| {
+                if shell
+                    .floating_mapped_geometry_on_output(workspace, mapped, output)
+                    .is_none()
+                {
+                    return;
+                }
+
+                for (window, _) in mapped.windows() {
+                    if let Some(feedback) = window
+                        .wl_surface()
+                        .and_then(|wl_surface| {
+                            advertised_node_for_surface(&wl_surface, &self.display_handle)
+                        })
+                        .and_then(&mut dmabuf_feedback)
+                    {
+                        window.send_dmabuf_feedback(
+                            output,
+                            &feedback,
+                            render_element_states,
+                            surface_primary_scanout_output,
+                        );
+                    }
+                }
+            });
+        }
 
         shell.override_redirect_windows.iter().for_each(|or| {
             if let Some(wl_surface) = or.wl_surface()
@@ -1371,6 +1398,25 @@ impl Common {
                     window.send_frame(output, time, throttle(&window, overload_level), should_send);
                 }
             });
+            for workspace in shell.cross_output_floating_workspaces(output) {
+                workspace.floating_layer.mapped().for_each(|mapped| {
+                    if shell
+                        .floating_mapped_geometry_on_output(workspace, mapped, output)
+                        .is_none()
+                    {
+                        return;
+                    }
+
+                    for (window, _) in mapped.windows() {
+                        window.send_frame(
+                            output,
+                            time,
+                            throttle(&window, overload_level),
+                            should_send,
+                        );
+                    }
+                });
+            }
 
             // other (throttled) windows
             active.minimized_windows.iter().for_each(|m| {

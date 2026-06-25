@@ -628,11 +628,13 @@ fn focus_target_is_valid(
             let workspace = shell.active_space(output).unwrap();
             let focus_stack = workspace.focus_stack.get(seat);
             let is_in_focus_stack = focus_stack.last().map(|m| m == &mapped).unwrap_or(false);
-            if is_sticky && !is_in_focus_stack {
+            let is_active_floating_on_output =
+                shell.mapped_is_active_floating_on_output(&mapped, output);
+            if (is_sticky || is_active_floating_on_output) && !is_in_focus_stack {
                 shell.append_focus_stack(mapped, seat);
             }
 
-            is_sticky || is_in_focus_stack
+            is_sticky || is_in_focus_stack || is_active_floating_on_output
         }
         KeyboardFocusTarget::LayerSurface(layer) => {
             layer_map_for_output(output).layers().any(|l| l == &layer)

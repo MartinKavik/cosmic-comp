@@ -317,11 +317,12 @@ impl CompositorHandler for State {
         shell.note_commit_total();
 
         let layer_output = shell.layer_output_for_surface(surface).cloned();
-        let visible_output = if layer_output.is_none() {
-            shell.visible_output_for_surface(surface).cloned()
+        let render_outputs = if layer_output.is_none() {
+            shell.render_outputs_for_surface(surface)
         } else {
-            None
+            Vec::new()
         };
+        let visible_output = render_outputs.first().cloned();
 
         // schedule a new render
         const DEFERRED_VISIBLE_RENDER_DELAY: Duration = Duration::from_millis(16);
@@ -348,13 +349,23 @@ impl CompositorHandler for State {
 
         let layer_schedule_output = layer_output
             .as_ref()
-            .filter(|output| shell.should_schedule_layer_commit_render(surface, output));
-        if let Some(output) =
-            layer_schedule_output.or(matches!(schedule_decision, CommitScheduleDecision::Visible)
-                .then_some(visible_output.as_ref())
-                .flatten())
-        {
+            .filter(|output| shell.should_schedule_layer_commit_render(surface, output))
+            .cloned();
+        let visible_schedule_output = matches!(schedule_decision, CommitScheduleDecision::Visible)
+            .then(|| visible_output.clone())
+            .flatten();
+        let scheduled_output = layer_schedule_output.or(visible_schedule_output);
+        if let Some(output) = scheduled_output.as_ref() {
             self.backend.schedule_render(output);
+        }
+        for output in render_outputs {
+            if scheduled_output
+                .as_ref()
+                .is_some_and(|scheduled| scheduled == &output)
+            {
+                continue;
+            }
+            self.backend.schedule_render(&output);
         }
         if let Some((output, delay)) = deferred_visible_render {
             schedule_deferred_output_render(&self.common.event_loop_handle, output, delay);

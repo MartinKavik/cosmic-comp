@@ -396,7 +396,7 @@ impl FloatingLayout {
         self.space.refresh();
     }
 
-    pub(in crate::shell) fn map_internal(
+    pub(crate) fn map_internal(
         &mut self,
         mapped: CosmicMapped,
         position: Option<Point<i32, Local>>,

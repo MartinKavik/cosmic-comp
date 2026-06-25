@@ -22,9 +22,11 @@ use crate::{
     },
     config::ScreenFilter,
     shell::{
-        CosmicMappedRenderElement, OverviewMode, SeatExt, Trigger, WorkspaceDelta,
+        CosmicMappedRenderElement, OverviewMode, SeatExt, Trigger, Workspace, WorkspaceDelta,
         WorkspaceRenderElement,
-        element::CosmicMappedKey,
+        element::{
+            CosmicMappedKey, stack::CosmicStackRenderElement, window::CosmicWindowRenderElement,
+        },
         focus::{FocusTarget, Stage, render_input_order, target::WindowGroup},
         grabs::{SeatMenuGrabState, SeatMoveGrabState},
         layout::tiling::ANIMATION_DURATION,
@@ -69,6 +71,7 @@ use smithay::{
             sync::SyncPoint,
         },
     },
+    desktop::space::SpaceElement,
     input::Seat,
     output::{Output, OutputModeSource, OutputNoMode},
     utils::{
@@ -1173,6 +1176,8 @@ where
                 Stage::StickyPopups(_) => RenderStageKind::StickyPopups,
                 Stage::Sticky(_) => RenderStageKind::Sticky,
                 Stage::WorkspacePopups { .. } => RenderStageKind::WorkspacePopups,
+                Stage::CrossOutputWorkspacePopups { .. } => RenderStageKind::WorkspacePopups,
+                Stage::CrossOutputWorkspace { .. } => RenderStageKind::Workspace,
                 Stage::Workspace { .. } => RenderStageKind::Workspace,
             };
             let stage_start = Instant::now();
@@ -1352,6 +1357,18 @@ where
                         ));
                         ControlFlow::Continue(())
                     }
+                    Stage::CrossOutputWorkspacePopups { workspace } => {
+                        let alpha = workspace_overview_alpha(&overview.0);
+                        elements.extend(
+                            cross_output_floating_elements(
+                                renderer, output, workspace, alpha, true,
+                            )
+                            .into_iter()
+                            .flat_map(crop_to_output)
+                            .map(Into::into),
+                        );
+                        ControlFlow::Continue(())
+                    }
                     Stage::Workspace { workspace, offset } => {
                         let rendered = match workspace.render(
                             renderer,
@@ -1376,6 +1393,18 @@ where
                         ));
                         ControlFlow::Continue(())
                     }
+                    Stage::CrossOutputWorkspace { workspace } => {
+                        let alpha = workspace_overview_alpha(&overview.0);
+                        elements.extend(
+                            cross_output_floating_elements(
+                                renderer, output, workspace, alpha, false,
+                            )
+                            .into_iter()
+                            .flat_map(crop_to_output)
+                            .map(Into::into),
+                        );
+                        ControlFlow::Continue(())
+                    }
                 };
             let added = elements.len().saturating_sub(elements_before);
             render_metrics.note_stage(stage_kind, stage_start.elapsed(), added);
@@ -1395,6 +1424,111 @@ where
     });
 
     Ok(elements)
+}
+
+fn workspace_overview_alpha(overview: &OverviewMode) -> f32 {
+    match overview {
+        OverviewMode::Started(_, started) => {
+            (1.0 - (Instant::now().duration_since(*started).as_millis()
+                / ANIMATION_DURATION.as_millis()) as f32)
+                .max(0.0)
+                * 0.4
+                + 0.6
+        }
+        OverviewMode::Ended(_, ended) => {
+            ((Instant::now().duration_since(*ended).as_millis() / ANIMATION_DURATION.as_millis())
+                as f32)
+                * 0.4
+                + 0.6
+        }
+        OverviewMode::Active(_) => 0.6,
+        OverviewMode::None => 1.0,
+    }
+}
+
+fn cross_output_floating_elements<R>(
+    renderer: &mut R,
+    output: &Output,
+    workspace: &Workspace,
+    alpha: f32,
+    popups: bool,
+) -> Vec<WorkspaceRenderElement<R>>
+where
+    R: AsGlowRenderer,
+    R::TextureId: Send + Clone + 'static,
+    CosmicMappedRenderElement<R>: RenderElement<R>,
+    CosmicWindowRenderElement<R>: RenderElement<R>,
+    CosmicStackRenderElement<R>: RenderElement<R>,
+{
+    if workspace.output() == output {
+        return Vec::new();
+    };
+
+    let output_scale = output.current_scale().fractional_scale();
+    let mut elements = Vec::new();
+
+    for mapped in workspace.floating_layer.mapped() {
+        let Some(global_geometry) = workspace
+            .floating_layer
+            .element_geometry(mapped)
+            .map(|geometry| geometry.to_global(workspace.output()))
+        else {
+            continue;
+        };
+        if global_geometry
+            .intersection(crate::utils::prelude::OutputExt::geometry(output))
+            .is_none()
+        {
+            continue;
+        }
+
+        let render_location =
+            global_geometry.to_local(output).loc - SpaceElement::geometry(mapped).loc.as_local();
+        let render_location = render_location
+            .as_logical()
+            .to_physical_precise_round(output_scale);
+
+        if popups {
+            elements.extend(
+                mapped
+                    .popup_render_elements::<R, CosmicMappedRenderElement<R>>(
+                        renderer,
+                        render_location,
+                        output_scale.into(),
+                        alpha,
+                    )
+                    .into_iter()
+                    .map(WorkspaceRenderElement::from),
+            );
+        } else {
+            let mut mapped_elements = mapped.render_elements::<R, CosmicMappedRenderElement<R>>(
+                renderer,
+                render_location,
+                None,
+                output_scale.into(),
+                alpha,
+                None,
+            );
+            mapped_elements.extend(
+                mapped.shadow_render_element::<R, CosmicMappedRenderElement<R>>(
+                    renderer,
+                    render_location,
+                    None,
+                    output_scale.into(),
+                    1.0,
+                    alpha,
+                ),
+            );
+
+            elements.extend(
+                mapped_elements
+                    .into_iter()
+                    .map(WorkspaceRenderElement::from),
+            );
+        }
+    }
+
+    elements
 }
 
 fn session_lock_elements<R>(

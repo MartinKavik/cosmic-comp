@@ -2765,6 +2765,11 @@ impl Shell {
                     return Some(seat.active_output());
                 }
 
+                let active_output = seat.active_output();
+                if self.mapped_is_active_floating_on_output(&elem, &active_output) {
+                    return Some(active_output);
+                }
+
                 self.outputs()
                     .find(|output| {
                         let is_sticky = self
@@ -4667,6 +4672,112 @@ impl Shell {
                 },
             )
             .unwrap_or_else(Rectangle::default)
+    }
+
+    pub fn cross_output_floating_workspaces<'a>(
+        &'a self,
+        target_output: &'a Output,
+    ) -> impl Iterator<Item = &'a Workspace> + 'a {
+        self.workspaces
+            .sets
+            .iter()
+            .filter_map(move |(source_output, set)| {
+                if source_output == target_output {
+                    return None;
+                }
+
+                let workspace = set.workspaces.get(set.active)?;
+                workspace
+                    .floating_layer
+                    .mapped()
+                    .any(|mapped| {
+                        self.floating_mapped_geometry_on_output(workspace, mapped, target_output)
+                            .is_some()
+                    })
+                    .then_some(workspace)
+            })
+    }
+
+    pub fn floating_mapped_geometry_on_output(
+        &self,
+        workspace: &Workspace,
+        mapped: &CosmicMapped,
+        output: &Output,
+    ) -> Option<Rectangle<i32, Global>> {
+        if mapped.is_minimized() {
+            return None;
+        }
+
+        let geometry = workspace
+            .floating_layer
+            .element_geometry(mapped)?
+            .to_global(workspace.output());
+        geometry.intersection(output.geometry()).map(|_| geometry)
+    }
+
+    pub fn active_floating_mapped_geometry(
+        &self,
+        mapped: &CosmicMapped,
+    ) -> Option<(&Workspace, Rectangle<i32, Global>)> {
+        self.workspaces.sets.values().find_map(|set| {
+            let workspace = set.workspaces.get(set.active)?;
+            let geometry = workspace
+                .floating_layer
+                .element_geometry(mapped)?
+                .to_global(workspace.output());
+            Some((workspace, geometry))
+        })
+    }
+
+    pub fn mapped_is_active_floating_on_output(
+        &self,
+        mapped: &CosmicMapped,
+        output: &Output,
+    ) -> bool {
+        self.active_floating_mapped_geometry(mapped)
+            .is_some_and(|(_, geometry)| geometry.intersection(output.geometry()).is_some())
+    }
+
+    pub fn update_floating_output_membership(&self, mapped: &CosmicMapped) {
+        let Some((_, geometry)) = self.active_floating_mapped_geometry(mapped) else {
+            return;
+        };
+
+        for output in self.outputs() {
+            if let Some(overlap) = output
+                .geometry()
+                .as_logical()
+                .intersection(geometry.as_logical())
+            {
+                mapped.output_enter(output, overlap);
+            } else {
+                mapped.output_leave(output);
+            }
+        }
+    }
+
+    pub fn render_outputs_for_surface(&self, surface: &WlSurface) -> Vec<Output> {
+        let mut outputs = Vec::new();
+        if let Some(output) = self.visible_output_for_surface(surface).cloned() {
+            outputs.push(output);
+        }
+
+        let Some(mapped) = self.cached_element_for_surface(surface) else {
+            return outputs;
+        };
+        let Some((_, geometry)) = self.active_floating_mapped_geometry(mapped) else {
+            return outputs;
+        };
+
+        for output in self.outputs() {
+            if geometry.intersection(output.geometry()).is_some()
+                && !outputs.iter().any(|existing| existing == output)
+            {
+                outputs.push(output.clone());
+            }
+        }
+
+        outputs
     }
 
     pub fn animations_going(&self) -> bool {
@@ -7396,6 +7507,27 @@ impl Shell {
 
         if let Some(active) = self.active_space(output) {
             active.mapped().for_each(|mapped| {
+                mapped.active_window().take_presentation_feedback(
+                    &mut output_presentation_feedback,
+                    surface_primary_scanout_output,
+                    |surface, _| {
+                        surface_presentation_feedback_flags_from_states(
+                            surface,
+                            render_element_states,
+                        )
+                    },
+                );
+            });
+        }
+        for workspace in self.cross_output_floating_workspaces(output) {
+            workspace.floating_layer.mapped().for_each(|mapped| {
+                if self
+                    .floating_mapped_geometry_on_output(workspace, mapped, output)
+                    .is_none()
+                {
+                    return;
+                }
+
                 mapped.active_window().take_presentation_feedback(
                     &mut output_presentation_feedback,
                     surface_primary_scanout_output,

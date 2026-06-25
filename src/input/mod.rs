@@ -2122,6 +2122,14 @@ impl State {
                             return ControlFlow::Break(Ok(Some(element)));
                         }
                     }
+                    Stage::CrossOutputWorkspacePopups { workspace } => {
+                        if let Some(element) = workspace
+                            .floating_layer
+                            .popup_element_under(global_pos.to_local(workspace.output()))
+                        {
+                            return ControlFlow::Break(Ok(Some(element)));
+                        }
+                    }
                     Stage::Workspace { workspace, offset } => {
                         let location = global_pos + offset.as_global().to_f64();
                         let output = workspace.output();
@@ -2132,6 +2140,14 @@ impl State {
                                 geometry.contains(global_pos.to_local(output).to_i32_round())
                             })
                             && let Some(element) = workspace.toplevel_element_under(location, seat)
+                        {
+                            return ControlFlow::Break(Ok(Some(element)));
+                        }
+                    }
+                    Stage::CrossOutputWorkspace { workspace } => {
+                        if let Some(element) = workspace
+                            .floating_layer
+                            .toplevel_element_under(global_pos.to_local(workspace.output()))
                         {
                             return ControlFlow::Break(Ok(Some(element)));
                         }
@@ -2280,10 +2296,28 @@ impl State {
                             return ControlFlow::Break(Ok(Some(under)));
                         }
                     }
+                    Stage::CrossOutputWorkspacePopups { workspace } => {
+                        if let Some(under) = workspace
+                            .floating_layer
+                            .popup_surface_under(global_pos.to_local(workspace.output()))
+                            .map(|(target, point)| (target, point.to_global(workspace.output())))
+                        {
+                            return ControlFlow::Break(Ok(Some(under)));
+                        }
+                    }
                     Stage::Workspace { workspace, offset } => {
                         let global_pos = global_pos + offset.to_f64().as_global();
                         if let Some(under) =
                             workspace.toplevel_surface_under(global_pos, overview.clone(), seat)
+                        {
+                            return ControlFlow::Break(Ok(Some(under)));
+                        }
+                    }
+                    Stage::CrossOutputWorkspace { workspace } => {
+                        if let Some(under) = workspace
+                            .floating_layer
+                            .toplevel_surface_under(global_pos.to_local(workspace.output()))
+                            .map(|(target, point)| (target, point.to_global(workspace.output())))
                         {
                             return ControlFlow::Break(Ok(Some(under)));
                         }

@@ -911,27 +911,32 @@ impl XwmHandler for State {
         _reorder: Option<Reorder>,
     ) {
         // We only allow floating X11 windows to resize themselves. Nothing else
-        let shell = self.common.shell.read();
+        let mut shell = self.common.shell.write();
 
         // TODO: Fullscreen
         if let Some(mapped) = shell
             .element_for_surface(&window)
             .filter(|mapped| !mapped.is_minimized())
+            .cloned()
         {
-            let current_geo = if let Some(workspace) = shell.space_for(mapped) {
+            let floating_output = shell
+                .space_for(&mapped)
+                .filter(|workspace| workspace.is_floating(&window))
+                .map(|workspace| workspace.output().clone());
+            let current_geo = if let Some(workspace) = shell.space_for(&mapped) {
                 workspace
-                    .element_geometry(mapped)
+                    .element_geometry(&mapped)
                     .filter(|_| workspace.is_floating(&window))
                     .map(|geo| geo.to_global(workspace.output()))
             } else if let Some((output, set)) = shell
                 .workspaces
                 .sets
                 .iter()
-                .find(|(_, set)| set.sticky_layer.mapped().any(|m| m == mapped))
+                .find(|(_, set)| set.sticky_layer.mapped().any(|m| m == &mapped))
             {
                 Some(
                     set.sticky_layer
-                        .element_geometry(mapped)
+                        .element_geometry(&mapped)
                         .unwrap()
                         .to_global(output),
                 )
@@ -941,15 +946,56 @@ impl XwmHandler for State {
 
             if let Some(current_geo) = current_geo {
                 let ssd_height = mapped.ssd_height(false).unwrap_or(0);
-                mapped.set_geometry(Rectangle::new(
-                    current_geo.loc,
+                let mut new_geo = Rectangle::new(
+                    if floating_output.is_some() {
+                        (
+                            x.unwrap_or(current_geo.loc.x),
+                            y.unwrap_or(current_geo.loc.y),
+                        )
+                            .into()
+                    } else {
+                        current_geo.loc
+                    },
                     (
-                        w.map(|w| w as i32).unwrap_or(current_geo.size.w),
+                        w.map(|w| w as i32).unwrap_or(current_geo.size.w).max(1),
                         h.map(|h| h as i32 + ssd_height)
-                            .unwrap_or(current_geo.size.h),
+                            .unwrap_or(current_geo.size.h)
+                            .max(1),
                     )
                         .into(),
-                ))
+                );
+
+                if let Some(output) = floating_output {
+                    let bounds = shell.global_space();
+                    new_geo.size.w = new_geo.size.w.min(bounds.size.w).max(1);
+                    new_geo.size.h = new_geo.size.h.min(bounds.size.h).max(1);
+
+                    let max_x = bounds.loc.x + bounds.size.w - new_geo.size.w;
+                    let max_y = bounds.loc.y + bounds.size.h - new_geo.size.h;
+                    new_geo.loc.x = if max_x >= bounds.loc.x {
+                        new_geo.loc.x.clamp(bounds.loc.x, max_x)
+                    } else {
+                        bounds.loc.x
+                    };
+                    new_geo.loc.y = if max_y >= bounds.loc.y {
+                        new_geo.loc.y.clamp(bounds.loc.y, max_y)
+                    } else {
+                        bounds.loc.y
+                    };
+
+                    if let Some(workspace) = shell.space_for_mut(&mapped) {
+                        workspace.floating_layer.map_internal(
+                            mapped.clone(),
+                            Some(new_geo.loc.to_local(&output)),
+                            Some(new_geo.size.as_logical()),
+                            None,
+                        );
+                    }
+                    mapped.set_bounds(bounds.size.as_logical());
+                    shell.update_floating_output_membership(&mapped);
+                }
+
+                mapped.set_geometry(new_geo)
             } else {
                 let _ = window.configure(None); // ack and force old state
             }
