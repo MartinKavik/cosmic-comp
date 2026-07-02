@@ -12,6 +12,7 @@ use tracing::{error, warn};
 use zbus::blocking::{Connection, fdo::DBusProxy};
 
 pub mod a11y_keyboard_monitor;
+mod background_launch;
 #[cfg(feature = "systemd")]
 pub mod logind;
 mod name_owners;
@@ -22,6 +23,11 @@ pub fn init(
     executor: &ThreadPool,
 ) -> Result<Vec<RegistrationToken>> {
     let mut tokens = Vec::new();
+
+    match background_launch::init(evlh, executor) {
+        Ok(token) => tokens.push(token),
+        Err(err) => tracing::info!(?err, "Failed to initialize background launch D-Bus API"),
+    }
 
     match block_on(power::init()) {
         Ok(power_daemon) => {

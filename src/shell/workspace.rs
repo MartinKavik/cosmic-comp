@@ -108,6 +108,7 @@ pub struct Workspace {
     pub tiling_enabled: bool,
     pub fullscreen: Option<FullscreenSurface>,
     pub pinned: bool,
+    pub keep_alive: bool,
     pub id: Option<String>,
 
     pub handle: WorkspaceHandle,
@@ -378,6 +379,7 @@ impl Workspace {
             minimized_windows: Vec::new(),
             fullscreen: None,
             pinned: false,
+            keep_alive: false,
             id: None,
             handle,
             focus_stack: FocusStacks::default(),
@@ -411,6 +413,7 @@ impl Workspace {
             minimized_windows: Vec::new(),
             fullscreen: None,
             pinned: true,
+            keep_alive: false,
             id: pinned.id.clone(),
             handle,
             focus_stack: FocusStacks::default(),
@@ -468,7 +471,10 @@ impl Workspace {
     // Auto-removal of workspaces is allowed if empty, unless blocked by an
     // unused and unexpired activation token, or pinned.
     pub fn can_auto_remove(&self, xdg_activation_state: &XdgActivationState) -> bool {
-        self.is_empty() && !self.has_activation_token(xdg_activation_state) && !self.pinned
+        self.is_empty()
+            && !self.has_activation_token(xdg_activation_state)
+            && !self.pinned
+            && !self.keep_alive
     }
 
     pub fn refresh_focus_stack(&mut self) {

@@ -106,6 +106,14 @@ impl XdgActivationHandler for State {
         let Some(context) = token_data.user_data.get::<ActivationContext>() else {
             return;
         };
+        if self
+            .common
+            .shell
+            .read()
+            .is_background_launch_surface(&surface)
+        {
+            return;
+        }
 
         match context {
             ActivationContext::UrgentOnly => {

@@ -843,6 +843,7 @@ impl XwmHandler for State {
                 &window,
                 &mut self.common.toplevel_info_state,
                 &mut self.common.workspace_state,
+                &self.common.display_handle,
                 &self.common.event_loop_handle,
             );
             if let Some(target) = res {
@@ -1221,6 +1222,14 @@ impl XwmHandler for State {
         _currently_active_window: Option<X11Surface>,
     ) {
         if let Some(surface) = window.wl_surface() {
+            if self
+                .common
+                .shell
+                .read()
+                .is_background_launch_surface(&surface)
+            {
+                return;
+            }
             self.activate_surface(&surface, None);
         }
     }

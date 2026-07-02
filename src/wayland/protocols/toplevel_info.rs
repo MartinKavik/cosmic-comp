@@ -113,10 +113,14 @@ impl ToplevelRefreshBudget {
 
     pub const fn hard() -> Self {
         Self {
-            max_pairs: 8,
+            // In hard overload, one toplevel/client pair can still cost tens of
+            // milliseconds of wall time if the compositor is competing with
+            // compiler/linker load. Keep this protocol catch-up work sparse so
+            // redraw and input callbacks stay ahead of background status updates.
+            max_pairs: 1,
             max_elapsed: Duration::from_millis(1),
             full_sweep_interval: Duration::from_secs(60),
-            pending_interval: Duration::from_millis(250),
+            pending_interval: Duration::from_millis(1000),
         }
     }
 
@@ -978,6 +982,20 @@ pub fn window_from_handle<W: Window + 'static>(handle: ZcosmicToplevelHandleV1) 
     handle
         .data::<ToplevelHandleState<W>>()
         .and_then(|state| state.lock().unwrap().window.as_ref().and_then(W::upgrade))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hard_toplevel_refresh_budget_prioritizes_responsiveness() {
+        let budget = ToplevelRefreshBudget::hard();
+
+        assert_eq!(budget.max_pairs, 1);
+        assert_eq!(budget.max_elapsed, Duration::from_millis(1));
+        assert_eq!(budget.pending_interval(), Duration::from_millis(1000));
+    }
 }
 
 pub fn window_from_ext<W: Window + 'static, D>(

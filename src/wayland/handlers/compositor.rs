@@ -529,6 +529,7 @@ impl State {
                     &window,
                     &mut self.common.toplevel_info_state,
                     &mut self.common.workspace_state,
+                    &self.common.display_handle,
                     &self.common.event_loop_handle,
                 );
                 if let Some(target) = res {

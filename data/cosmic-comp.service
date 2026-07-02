@@ -8,5 +8,10 @@ Before=cosmic-session.target
 [Service]
 Type=notify
 ExecStart=/usr/bin/cosmic-comp
+Nice=-10
+CPUWeight=10000
+IOWeight=10000
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
 Restart=never
 ExecStopPost=/usr/bin/systemctl --user unset-environment DISPLAY WAYLAND_DISPLAY

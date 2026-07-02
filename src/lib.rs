@@ -59,6 +59,8 @@ static GLOBAL: profiling::tracy_client::ProfiledAllocator<std::alloc::System> =
 static MAIN_LOOP_STATS: LazyLock<Mutex<MainLoopStats>> =
     LazyLock::new(|| Mutex::new(MainLoopStats::default()));
 
+const COMPOSITOR_TARGET_NICE: i32 = -10;
+
 #[derive(Default)]
 struct MainLoopCounters {
     callbacks: u64,
@@ -217,6 +219,28 @@ fn maybe_log_main_loop_stats(stats: &mut MainLoopStats) {
     );
 }
 
+fn raise_compositor_priority() {
+    match rustix::process::getpriority_process(None) {
+        Ok(current) if current <= COMPOSITOR_TARGET_NICE => {
+            info!(nice = current, "Compositor CPU priority already elevated");
+        }
+        Ok(current) => match rustix::process::setpriority_process(None, COMPOSITOR_TARGET_NICE) {
+            Ok(()) => info!(
+                old_nice = current,
+                new_nice = COMPOSITOR_TARGET_NICE,
+                "Elevated compositor CPU priority"
+            ),
+            Err(err) => warn!(
+                old_nice = current,
+                target_nice = COMPOSITOR_TARGET_NICE,
+                ?err,
+                "Failed to elevate compositor CPU priority"
+            ),
+        },
+        Err(err) => warn!(?err, "Failed to read compositor CPU priority"),
+    }
+}
+
 // called by the Xwayland source, either after starting or failing
 impl State {
     fn notify_ready(&mut self) {
@@ -302,6 +326,7 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
     // setup logger
     logger::init_logger()?;
     info!("Cosmic starting up!");
+    raise_compositor_priority();
 
     profiling::register_thread!("Main Thread");
     #[cfg(feature = "profile-with-tracy")]
@@ -424,6 +449,28 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
+
+        state
+            .common
+            .background_launch_children
+            .retain_mut(|child| match child.try_wait() {
+                Ok(Some(exit_status)) => {
+                    info!(
+                        pid = child.id(),
+                        "Background-launched command exited with status {:?}", exit_status
+                    );
+                    false
+                }
+                Ok(None) => true,
+                Err(err) => {
+                    warn!(
+                        pid = child.id(),
+                        ?err,
+                        "Failed to wait for background-launched command"
+                    );
+                    false
+                }
+            });
     })?;
 
     // kill kiosk child if loop exited

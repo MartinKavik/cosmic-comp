@@ -245,6 +245,7 @@ pub struct Common {
     pub gesture_state: Option<GestureState>,
 
     pub kiosk_child: Option<Child>,
+    pub background_launch_children: Vec<Child>,
     pub theme: cosmic::Theme,
 
     // wayland state
@@ -754,6 +755,7 @@ impl State {
                 gesture_state: None,
 
                 kiosk_child: None,
+                background_launch_children: Vec::new(),
                 theme: cosmic::theme::system_preference(),
 
                 compositor_state,

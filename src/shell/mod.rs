@@ -5,6 +5,7 @@ use indexmap::IndexMap;
 use layout::TilingExceptions;
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     sync::{LazyLock, Mutex, atomic::Ordering},
     thread,
     time::{Duration, Instant},
@@ -46,7 +47,9 @@ use smithay::{
     output::{Output, WeakOutput},
     reexports::{
         wayland_protocols::ext::session_lock::v1::server::ext_session_lock_v1::ExtSessionLockV1,
-        wayland_server::{Client, Resource, backend::ObjectId, protocol::wl_surface::WlSurface},
+        wayland_server::{
+            Client, DisplayHandle, Resource, backend::ObjectId, protocol::wl_surface::WlSurface,
+        },
     },
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size},
     wayland::{
@@ -88,6 +91,63 @@ pub mod element;
 pub mod focus;
 pub mod grabs;
 pub mod layout;
+
+const BACKGROUND_LAUNCH_WORKSPACE_ID_PREFIX: &str = "background-launch:";
+const BACKGROUND_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const BACKGROUND_LAUNCH_ENV: &str = "COSMIC_BACKGROUND_LAUNCH_ID";
+
+fn background_launch_workspace_id(workspace_name: &str) -> String {
+    format!("{BACKGROUND_LAUNCH_WORKSPACE_ID_PREFIX}{workspace_name}")
+}
+
+fn is_background_launch_workspace_id(id: &str) -> bool {
+    id.starts_with(BACKGROUND_LAUNCH_WORKSPACE_ID_PREFIX)
+}
+
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(") ")?;
+    let mut fields = rest.split_whitespace();
+    fields.next()?;
+    fields.next()?.parse().ok()
+}
+
+fn is_descendant_pid(mut pid: u32, root_pid: u32) -> bool {
+    for _ in 0..64 {
+        if pid == root_pid {
+            return true;
+        }
+        let Some(parent) = parent_pid(pid) else {
+            return false;
+        };
+        if parent == 0 || parent == pid {
+            return false;
+        }
+        pid = parent;
+    }
+    false
+}
+
+fn process_env_value(pid: u32, key: &str) -> Option<String> {
+    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{key}=");
+    environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(prefix.as_bytes()))
+        .and_then(|value| String::from_utf8(value.to_vec()).ok())
+}
+
+fn surface_pid(window: &CosmicSurface, display_handle: &DisplayHandle) -> Option<u32> {
+    match window.0.underlying_surface() {
+        WindowSurface::Wayland(toplevel) => toplevel
+            .wl_surface()
+            .client()
+            .and_then(|client| client.get_credentials(display_handle).ok())
+            .and_then(|credentials| u32::try_from(credentials.pid).ok())
+            .filter(|pid| *pid > 0),
+        WindowSurface::X11(surface) => surface.get_client_pid().ok().filter(|pid| *pid > 0),
+    }
+}
 mod seats;
 mod workspace;
 pub mod zoom;
@@ -969,6 +1029,19 @@ pub struct PendingLayer {
 }
 
 #[derive(Debug)]
+struct BackgroundLaunchContext {
+    root_pid: u32,
+    workspace_name: String,
+    workspace_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct BackgroundLaunches {
+    contexts: HashMap<String, BackgroundLaunchContext>,
+}
+
+#[derive(Debug)]
 pub struct Shell {
     pub workspaces: Workspaces,
 
@@ -976,6 +1049,7 @@ pub struct Shell {
     pub pending_windows: Vec<PendingWindow>,
     pub pending_layers: Vec<PendingLayer>,
     pub pending_activations: HashMap<ActivationKey, ActivationContext>,
+    background_launches: BackgroundLaunches,
     pub override_redirect_windows: Vec<X11Surface>,
     pub session_lock: Option<SessionLock>,
     pub seats: Seats,
@@ -1274,6 +1348,28 @@ fn create_workspace(
     theme: cosmic::Theme,
     appearance: AppearanceConfig,
 ) -> Workspace {
+    create_workspace_with_id(
+        state,
+        output,
+        group_handle,
+        active,
+        tiling,
+        theme,
+        appearance,
+        None,
+    )
+}
+
+fn create_workspace_with_id(
+    state: &mut WorkspaceUpdateGuard<'_, State>,
+    output: &Output,
+    group_handle: &WorkspaceGroupHandle,
+    active: bool,
+    tiling: bool,
+    theme: cosmic::Theme,
+    appearance: AppearanceConfig,
+    id: Option<String>,
+) -> Workspace {
     let workspace_handle = state
         .create_workspace(
             group_handle,
@@ -1282,8 +1378,7 @@ fn create_workspace(
             } else {
                 TilingState::FloatingOnly
             },
-            // TODO Set id for persistent workspaces
-            None,
+            id.clone(),
         )
         .unwrap();
     if active {
@@ -1296,13 +1391,15 @@ fn create_workspace(
             | WorkspaceCapabilities::Pin
             | WorkspaceCapabilities::Move,
     );
-    Workspace::new(
+    let mut workspace = Workspace::new(
         workspace_handle,
         output.clone(),
         tiling,
         theme.clone(),
         appearance,
-    )
+    );
+    workspace.id = id;
+    workspace
 }
 
 fn create_workspace_from_pinned(
@@ -1515,7 +1612,7 @@ impl WorkspaceSet {
         workspace_set_idx(
             state,
             self.workspaces.len() as u8 + 1,
-            &workspace.handle,
+            &workspace,
             // this method is only used by code paths related to dynamic workspaces, so this should be fine
         );
         self.workspaces.push(workspace);
@@ -1530,7 +1627,7 @@ impl WorkspaceSet {
         if self
             .workspaces
             .last()
-            .is_none_or(|last| !last.is_empty() || last.pinned)
+            .is_none_or(|last| !last.can_auto_remove(xdg_activation_state))
         {
             self.add_empty_workspace(state);
         }
@@ -1546,7 +1643,7 @@ impl WorkspaceSet {
                     && self
                         .workspaces
                         .get(i - 1)
-                        .is_some_and(|w| w.is_empty() && !w.pinned);
+                        .is_some_and(|w| w.can_auto_remove(xdg_activation_state));
                 let keep = if workspace.can_auto_remove(xdg_activation_state) {
                     // Keep empty workspace if it's active, or it's the last workspace,
                     // and the previous worspace is not both active and empty.
@@ -1577,7 +1674,7 @@ impl WorkspaceSet {
 
     fn update_workspace_idxs(&self, state: &mut WorkspaceUpdateGuard<'_, State>) {
         for (i, workspace) in self.workspaces.iter().enumerate() {
-            workspace_set_idx(state, i as u8 + 1, &workspace.handle);
+            workspace_set_idx(state, i as u8 + 1, workspace);
         }
     }
 
@@ -2076,7 +2173,7 @@ impl Workspaces {
                     .sets
                     .values()
                     .flat_map(|set| set.workspaces.last())
-                    .any(|w| !w.is_empty() || w.pinned)
+                    .any(|w| !w.can_auto_remove(xdg_activation_state))
                 {
                     for set in self.sets.values_mut() {
                         set.add_empty_workspace(workspace_state);
@@ -2538,6 +2635,7 @@ impl Shell {
             pending_windows: Vec::new(),
             pending_layers: Vec::new(),
             pending_activations: HashMap::new(),
+            background_launches: BackgroundLaunches::default(),
             override_redirect_windows: Vec::new(),
             session_lock: None,
             previous_workspace_idx: None,
@@ -5088,6 +5186,7 @@ impl Shell {
             }
         }
 
+        self.purge_expired_background_launches();
         self.workspaces
             .refresh(workspace_state, xdg_activation_state);
 
@@ -5295,11 +5394,165 @@ impl Shell {
     }
 
     #[must_use]
+    pub fn ensure_background_launch_workspace(
+        &mut self,
+        workspace_name: &str,
+        state: &mut WorkspaceUpdateGuard<'_, State>,
+    ) -> Option<WorkspaceHandle> {
+        let workspace_id = background_launch_workspace_id(workspace_name);
+
+        for set in self.workspaces.sets.values_mut() {
+            if let Some(workspace) = set
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.id.as_deref() == Some(workspace_id.as_str()))
+            {
+                workspace.keep_alive = true;
+                state.set_workspace_name(&workspace.handle, workspace_name);
+                return Some(workspace.handle);
+            }
+        }
+
+        let output = self
+            .outputs()
+            .find(|output| output.config().xwayland_primary)
+            .or_else(|| self.outputs().find(|output| output.is_internal()))
+            .or_else(|| self.outputs().next())
+            .cloned()?;
+        let set = self.workspaces.sets.get_mut(&output)?;
+
+        let mut workspace = create_workspace_with_id(
+            state,
+            &set.output,
+            &set.group,
+            false,
+            set.tiling_enabled,
+            self.theme.clone(),
+            self.appearance_conf,
+            Some(workspace_id),
+        );
+        workspace.keep_alive = true;
+        let handle = workspace.handle;
+        let insert_idx = if set.workspaces.last().is_some_and(|workspace| {
+            workspace.is_empty() && !workspace.pinned && !workspace.keep_alive
+        }) {
+            set.workspaces.len().saturating_sub(1)
+        } else {
+            set.workspaces.len()
+        };
+        if insert_idx <= set.active {
+            set.active += 1;
+        }
+        set.workspaces.insert(insert_idx, workspace);
+        set.update_workspace_idxs(state);
+        state.set_workspace_name(&handle, workspace_name);
+
+        Some(handle)
+    }
+
+    pub fn register_background_launch(
+        &mut self,
+        launch_id: String,
+        workspace_name: String,
+        root_pid: u32,
+        state: &mut WorkspaceUpdateGuard<'_, State>,
+    ) {
+        let workspace_id = background_launch_workspace_id(&workspace_name);
+        self.background_launches.contexts.insert(
+            launch_id,
+            BackgroundLaunchContext {
+                root_pid,
+                workspace_name: workspace_name.clone(),
+                workspace_id,
+                expires_at: Instant::now() + BACKGROUND_LAUNCH_TIMEOUT,
+            },
+        );
+        let _ = self.ensure_background_launch_workspace(&workspace_name, state);
+    }
+
+    fn purge_expired_background_launches(&mut self) {
+        let now = Instant::now();
+        self.background_launches
+            .contexts
+            .retain(|_, context| context.expires_at > now);
+        let active_workspace_ids = self
+            .background_launches
+            .contexts
+            .values()
+            .map(|context| context.workspace_id.clone())
+            .collect::<HashSet<_>>();
+        for workspace in self.workspaces.spaces_mut() {
+            if let Some(id) = workspace.id.as_deref()
+                && is_background_launch_workspace_id(id)
+            {
+                workspace.keep_alive = active_workspace_ids.contains(id);
+            }
+        }
+    }
+
+    fn background_workspace_for_window(
+        &mut self,
+        window: &CosmicSurface,
+        display_handle: &DisplayHandle,
+        workspace_state: &mut WorkspaceUpdateGuard<'_, State>,
+    ) -> Option<WorkspaceHandle> {
+        self.purge_expired_background_launches();
+
+        let token_workspace = window
+            .x11_surface()
+            .and_then(|surface| surface.startup_id())
+            .and_then(|startup_id| {
+                self.background_launches
+                    .contexts
+                    .get(&startup_id)
+                    .map(|context| context.workspace_name.clone())
+            });
+        let surface_pid = surface_pid(window, display_handle);
+        let env_workspace = surface_pid
+            .and_then(|pid| process_env_value(pid, BACKGROUND_LAUNCH_ENV))
+            .and_then(|launch_id| {
+                self.background_launches
+                    .contexts
+                    .get(&launch_id)
+                    .map(|context| context.workspace_name.clone())
+            });
+        let pid_workspace = surface_pid.and_then(|pid| {
+            self.background_launches
+                .contexts
+                .values()
+                .find(|context| is_descendant_pid(pid, context.root_pid))
+                .map(|context| context.workspace_name.clone())
+        });
+
+        token_workspace
+            .or(env_workspace)
+            .or(pid_workspace)
+            .and_then(|workspace_name| {
+                self.ensure_background_launch_workspace(&workspace_name, workspace_state)
+            })
+    }
+
+    pub fn is_background_launch_surface(&self, surface: &WlSurface) -> bool {
+        self.workspace_for_surface(surface)
+            .map(|(handle, _)| {
+                self.workspaces.spaces().any(|workspace| {
+                    workspace.handle == handle
+                        && workspace
+                            .id
+                            .as_deref()
+                            .is_some_and(is_background_launch_workspace_id)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn map_window(
         &mut self,
         window: &CosmicSurface,
         toplevel_info: &mut ToplevelInfoState<State, CosmicSurface>,
         workspace_state: &mut WorkspaceState<State>,
+        display_handle: &DisplayHandle,
         loop_handle: &LoopHandle<'static, State>,
     ) -> Option<KeyboardFocusTarget> {
         let pos = self
@@ -5332,10 +5585,16 @@ impl Shell {
         };
 
         let pending_activation = self.pending_activations.remove(&(&window).into());
-        let workspace_handle = match pending_activation {
+        let pending_workspace_handle = match pending_activation {
             Some(ActivationContext::Workspace(handle)) => Some(handle),
             _ => None,
         };
+        let background_workspace_handle = {
+            let mut workspace_state = workspace_state.update();
+            self.background_workspace_for_window(&window, display_handle, &mut workspace_state)
+        };
+        let suppress_focus = background_workspace_handle.is_some();
+        let workspace_handle = background_workspace_handle.or(pending_workspace_handle);
 
         let should_be_fullscreen = output.is_some();
         let mut output = output.unwrap_or_else(|| seat.active_output());
@@ -5381,6 +5640,9 @@ impl Shell {
         let was_activated = workspace_handle.is_some()
             && (workspace_output != seat.active_output() || active_handle != workspace.handle);
         let workspace_handle = workspace.handle;
+        if suppress_focus {
+            workspace_state.add_workspace_state(&workspace_handle, WState::Urgent);
+        }
         let is_dialog = layout::is_dialog(&window);
         let floating_exception = layout::has_floating_exception(&self.tiling_exceptions, &window);
 
@@ -5391,12 +5653,14 @@ impl Shell {
                 toplevel_leave_workspace(&surface, &workspace.handle);
                 self.remap_unfullscreened_window(surface, state, loop_handle);
             }
-            if was_activated {
+            if was_activated && !suppress_focus {
                 workspace_state.add_workspace_state(&workspace_handle, WState::Urgent);
             }
 
             self.rebuild_surface_index();
-            return (workspace_output == seat.active_output() && active_handle == workspace_handle)
+            return (!suppress_focus
+                && workspace_output == seat.active_output()
+                && active_handle == workspace_handle)
                 .then_some(KeyboardFocusTarget::Fullscreen(window));
         }
 
@@ -5406,11 +5670,13 @@ impl Shell {
             && !(workspace.is_tiled(&focused.active_window()) && floating_exception)
         {
             focused.stack_ref().unwrap().add_window(window, None, None);
-            if was_activated {
+            if was_activated && !suppress_focus {
                 workspace_state.add_workspace_state(&workspace_handle, WState::Urgent);
             }
             self.rebuild_surface_index();
-            return (workspace_output == seat.active_output() && active_handle == workspace_handle)
+            return (!suppress_focus
+                && workspace_output == seat.active_output()
+                && active_handle == workspace_handle)
                 .then_some(KeyboardFocusTarget::Element(focused));
         }
 
@@ -5452,16 +5718,18 @@ impl Shell {
             self.maximize_request(&mapped, &seat, false, loop_handle);
         }
 
-        let new_target = if (workspace_output == seat.active_output()
-            && active_handle == workspace_handle)
-            || parent_is_sticky
+        let new_target = if !suppress_focus
+            && ((workspace_output == seat.active_output() && active_handle == workspace_handle)
+                || parent_is_sticky)
         {
             // TODO: enforce focus stealing prevention by also checking the same rules as for the else case.
             Some(KeyboardFocusTarget::from(mapped.clone()))
         } else {
             if workspace_empty || was_activated {
                 self.append_focus_stack(mapped, &seat);
-                workspace_state.add_workspace_state(&workspace_handle, WState::Urgent);
+                if !suppress_focus {
+                    workspace_state.add_workspace_state(&workspace_handle, WState::Urgent);
+                }
             }
             None
         };
@@ -7584,13 +7852,15 @@ impl Shell {
     }
 }
 
-fn workspace_set_idx(
-    state: &mut WorkspaceUpdateGuard<'_, State>,
-    idx: u8,
-    handle: &WorkspaceHandle,
-) {
-    state.set_workspace_name(handle, format!("{}", idx));
-    state.set_workspace_coordinates(handle, &[idx as u32]);
+fn workspace_set_idx(state: &mut WorkspaceUpdateGuard<'_, State>, idx: u8, workspace: &Workspace) {
+    if !workspace
+        .id
+        .as_deref()
+        .is_some_and(is_background_launch_workspace_id)
+    {
+        state.set_workspace_name(&workspace.handle, format!("{}", idx));
+    }
+    state.set_workspace_coordinates(&workspace.handle, &[idx as u32]);
 }
 
 pub fn check_grab_preconditions(
