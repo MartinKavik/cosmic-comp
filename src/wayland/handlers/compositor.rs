@@ -15,7 +15,7 @@ use smithay::{
         utils::{on_commit_buffer_handler, with_renderer_surface_state},
     },
     delegate_compositor,
-    desktop::{LayerSurface, PopupKind, layer_map_for_output},
+    desktop::{LayerSurface, PopupKind, layer_map_for_output, utils::send_frames_surface_tree},
     output::Output,
     reexports::wayland_server::{Client, Resource, protocol::wl_surface::WlSurface},
     utils::{Clock, Logical, Monotonic, SERIAL_COUNTER, Size, Time},
@@ -59,6 +59,53 @@ fn schedule_deferred_output_render(
         TimeoutAction::Drop
     }) {
         warn!(?err, "failed to schedule deferred visible render");
+    }
+}
+
+fn surface_requests_frame_callback(surface: &WlSurface) -> bool {
+    with_states(surface, |states| {
+        !states
+            .cached_state
+            .get::<SurfaceAttributes>()
+            .current()
+            .frame_callbacks
+            .is_empty()
+    })
+}
+
+fn schedule_background_frame_tick(
+    loop_handle: &LoopHandle<'static, State>,
+    workspace_id: String,
+    delay: Duration,
+) -> bool {
+    let timer_workspace_id = workspace_id.clone();
+    match loop_handle.insert_source(Timer::from_duration(delay), move |_, _, state| {
+        let frames = {
+            let mut shell = state.common.shell.write();
+            let requests = shell.take_background_frame_requests(&timer_workspace_id);
+            requests
+                .into_iter()
+                .filter_map(|surface| {
+                    shell
+                        .background_frame_output(&timer_workspace_id, &surface)
+                        .map(|output| (surface, output))
+                })
+                .collect::<Vec<_>>()
+        };
+        let time = state.common.clock.now();
+        for (surface, output) in frames {
+            send_frames_surface_tree(&surface, &output, time, Some(Duration::ZERO), |_, _| None);
+        }
+        TimeoutAction::Drop
+    }) {
+        Ok(_) => true,
+        Err(err) => {
+            warn!(
+                ?err,
+                workspace_id, "failed to schedule background frame tick"
+            );
+            false
+        }
     }
 }
 
@@ -323,6 +370,9 @@ impl CompositorHandler for State {
             Vec::new()
         };
         let visible_output = render_outputs.first().cloned();
+        let background_frame_tick = surface_requests_frame_callback(surface)
+            .then(|| shell.request_background_frame_tick(surface))
+            .flatten();
 
         // schedule a new render
         const DEFERRED_VISIBLE_RENDER_DELAY: Duration = Duration::from_millis(16);
@@ -369,6 +419,15 @@ impl CompositorHandler for State {
         }
         if let Some((output, delay)) = deferred_visible_render {
             schedule_deferred_output_render(&self.common.event_loop_handle, output, delay);
+        }
+        if let Some((workspace_id, delay)) = background_frame_tick
+            && !schedule_background_frame_tick(
+                &self.common.event_loop_handle,
+                workspace_id.clone(),
+                delay,
+            )
+        {
+            shell.cancel_background_frame_tick(&workspace_id);
         }
         shell.note_commit_schedule_decision(schedule_decision);
 

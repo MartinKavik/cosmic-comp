@@ -95,6 +95,51 @@ pub mod layout;
 const BACKGROUND_LAUNCH_WORKSPACE_ID_PREFIX: &str = "background-launch:";
 const BACKGROUND_LAUNCH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const BACKGROUND_LAUNCH_ENV: &str = "COSMIC_BACKGROUND_LAUNCH_ID";
+const DEFAULT_BACKGROUND_REFRESH_MILLIHZ: i32 = 60_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundFramePacing {
+    Standard,
+    Demand,
+}
+
+impl std::str::FromStr for BackgroundFramePacing {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "standard" => Ok(Self::Standard),
+            "demand" => Ok(Self::Demand),
+            _ => Err(format!(
+                "unknown frame pacing policy {value:?}; expected standard or demand"
+            )),
+        }
+    }
+}
+
+fn background_refresh_interval(refresh_millihertz: Option<i32>) -> Duration {
+    let refresh_millihertz = refresh_millihertz
+        .filter(|refresh| *refresh > 0)
+        .unwrap_or(DEFAULT_BACKGROUND_REFRESH_MILLIHZ) as u64;
+    Duration::from_nanos(1_000_000_000_000 / refresh_millihertz)
+}
+
+fn next_background_frame_delay(
+    elapsed_since_tick: Option<Duration>,
+    refresh_interval: Duration,
+) -> Duration {
+    let Some(elapsed) = elapsed_since_tick else {
+        return refresh_interval;
+    };
+    let refresh_nanos = refresh_interval.as_nanos();
+    let remainder_nanos = elapsed.as_nanos() % refresh_nanos;
+    let delay_nanos = if remainder_nanos == 0 {
+        refresh_nanos
+    } else {
+        refresh_nanos - remainder_nanos
+    };
+    Duration::from_nanos(delay_nanos.try_into().unwrap_or(u64::MAX))
+}
 
 fn background_launch_workspace_id(workspace_name: &str) -> String {
     format!("{BACKGROUND_LAUNCH_WORKSPACE_ID_PREFIX}{workspace_name}")
@@ -1037,8 +1082,22 @@ struct BackgroundLaunchContext {
 }
 
 #[derive(Debug, Default)]
+struct BackgroundDemandFrameState {
+    pending_surfaces: HashMap<ObjectId, WlSurface>,
+    timer_scheduled: bool,
+    last_tick: Option<Instant>,
+}
+
+#[derive(Debug)]
+struct BackgroundWorkspaceContext {
+    frame_pacing: BackgroundFramePacing,
+    demand_frames: BackgroundDemandFrameState,
+}
+
+#[derive(Debug, Default)]
 struct BackgroundLaunches {
     contexts: HashMap<String, BackgroundLaunchContext>,
+    workspaces: HashMap<String, BackgroundWorkspaceContext>,
 }
 
 #[derive(Debug)]
@@ -4492,11 +4551,33 @@ impl Shell {
             })
     }
 
+    pub fn associated_output_for_surface(&self, surface: &WlSurface) -> Option<Output> {
+        self.workspace_for_surface(surface)
+            .map(|(_, output)| output)
+            .or_else(|| self.layer_output_for_surface(surface).cloned())
+            .or_else(|| self.indexed_output_for_surface(surface).cloned())
+            .or_else(|| {
+                with_states(surface, |states| {
+                    surface_primary_scanout_output(surface, states)
+                })
+                .filter(|primary| self.outputs().any(|output| output == primary))
+            })
+            .or_else(|| {
+                self.cached_element_for_surface(surface)
+                    .and_then(|mapped| self.output_for_mapped(mapped))
+                    .cloned()
+            })
+    }
+
     pub fn visible_output_for_surface(&self, surface: &WlSurface) -> Option<&Output> {
         if let Some(primary_output) = with_states(surface, |states| {
             surface_primary_scanout_output(surface, states)
         }) {
-            if let Some(output) = self.outputs().find(|output| **output == primary_output) {
+            if let Some(output) = self
+                .outputs()
+                .find(|output| **output == primary_output)
+                .filter(|output| self.surface_visible_on_output(surface, output))
+            {
                 Self::update_surface_lookup_output_cache(surface, output);
                 self.note_visible_output_path("primary_scanout");
                 return Some(output);
@@ -4516,7 +4597,10 @@ impl Shell {
             return output;
         }
 
-        if let Some(output) = self.indexed_output_for_surface(surface) {
+        if let Some(output) = self
+            .indexed_output_for_surface(surface)
+            .filter(|output| self.surface_visible_on_output(surface, output))
+        {
             self.note_visible_output_path("index");
             return Some(output);
         }
@@ -4528,6 +4612,7 @@ impl Shell {
 
         if let Some(mapped) = self.cached_element_hint_for_surface(surface)
             && let Some(output) = self.output_for_mapped(mapped)
+            && self.surface_visible_on_output(surface, output)
         {
             Self::update_surface_lookup_output_cache(surface, output);
             self.note_visible_output_path("element_hint");
@@ -5455,6 +5540,7 @@ impl Shell {
         launch_id: String,
         workspace_name: String,
         root_pid: u32,
+        frame_pacing: BackgroundFramePacing,
         state: &mut WorkspaceUpdateGuard<'_, State>,
     ) {
         let workspace_id = background_launch_workspace_id(&workspace_name);
@@ -5463,10 +5549,18 @@ impl Shell {
             BackgroundLaunchContext {
                 root_pid,
                 workspace_name: workspace_name.clone(),
-                workspace_id,
+                workspace_id: workspace_id.clone(),
                 expires_at: Instant::now() + BACKGROUND_LAUNCH_TIMEOUT,
             },
         );
+        self.background_launches
+            .workspaces
+            .entry(workspace_id)
+            .and_modify(|context| context.frame_pacing = frame_pacing)
+            .or_insert_with(|| BackgroundWorkspaceContext {
+                frame_pacing,
+                demand_frames: BackgroundDemandFrameState::default(),
+            });
         let _ = self.ensure_background_launch_workspace(&workspace_name, state);
     }
 
@@ -5488,6 +5582,19 @@ impl Shell {
                 workspace.keep_alive = active_workspace_ids.contains(id);
             }
         }
+        let retained_workspace_ids = self
+            .workspaces
+            .spaces()
+            .filter_map(|workspace| {
+                let id = workspace.id.as_deref()?;
+                (is_background_launch_workspace_id(id)
+                    && (active_workspace_ids.contains(id) || !workspace.is_empty()))
+                .then(|| id.to_string())
+            })
+            .collect::<HashSet<_>>();
+        self.background_launches
+            .workspaces
+            .retain(|id, _| retained_workspace_ids.contains(id));
     }
 
     fn background_workspace_for_window(
@@ -5544,6 +5651,85 @@ impl Shell {
                 })
             })
             .unwrap_or(false)
+    }
+
+    fn demand_paced_background_output_for_surface(
+        &self,
+        surface: &WlSurface,
+    ) -> Option<(String, Output)> {
+        let (handle, output) = self.workspace_for_surface(surface)?;
+        let workspace = self.workspaces.space_for_handle(&handle)?;
+        let workspace_id = workspace.id.as_deref()?;
+        if !is_background_launch_workspace_id(workspace_id)
+            || self
+                .active_space(&output)
+                .is_some_and(|active| active.handle == handle)
+            || self
+                .background_launches
+                .workspaces
+                .get(workspace_id)?
+                .frame_pacing
+                != BackgroundFramePacing::Demand
+        {
+            return None;
+        }
+
+        Some((workspace_id.to_string(), output))
+    }
+
+    pub fn request_background_frame_tick(
+        &mut self,
+        surface: &WlSurface,
+    ) -> Option<(String, Duration)> {
+        let (workspace_id, output) = self.demand_paced_background_output_for_surface(surface)?;
+        let refresh_interval =
+            background_refresh_interval(output.current_mode().map(|mode| mode.refresh));
+        let now = Instant::now();
+        let state = &mut self
+            .background_launches
+            .workspaces
+            .get_mut(&workspace_id)?
+            .demand_frames;
+        state.pending_surfaces.insert(surface.id(), surface.clone());
+        if state.timer_scheduled {
+            return None;
+        }
+
+        let delay = next_background_frame_delay(
+            state
+                .last_tick
+                .map(|last_tick| now.saturating_duration_since(last_tick)),
+            refresh_interval,
+        );
+        state.timer_scheduled = true;
+        Some((workspace_id, delay))
+    }
+
+    pub fn take_background_frame_requests(&mut self, workspace_id: &str) -> Vec<WlSurface> {
+        let Some(context) = self.background_launches.workspaces.get_mut(workspace_id) else {
+            return Vec::new();
+        };
+        context.demand_frames.timer_scheduled = false;
+        context.demand_frames.last_tick = Some(Instant::now());
+        std::mem::take(&mut context.demand_frames.pending_surfaces)
+            .into_values()
+            .collect()
+    }
+
+    pub fn cancel_background_frame_tick(&mut self, workspace_id: &str) {
+        if let Some(context) = self.background_launches.workspaces.get_mut(workspace_id) {
+            context.demand_frames.timer_scheduled = false;
+        }
+    }
+
+    pub fn background_frame_output(
+        &self,
+        workspace_id: &str,
+        surface: &WlSurface,
+    ) -> Option<Output> {
+        self.demand_paced_background_output_for_surface(surface)
+            .filter(|(current_workspace_id, _)| current_workspace_id == workspace_id)
+            .map(|(_, output)| output)
     }
 
     #[must_use]
@@ -7849,6 +8035,55 @@ impl Shell {
                         .chain(w.minimized_windows.iter().flat_map(|m| m.mapped()))
                 }))
         })
+    }
+}
+
+#[cfg(test)]
+mod background_frame_pacing_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_interval_uses_millihertz_and_a_safe_default() {
+        assert_eq!(
+            background_refresh_interval(Some(60_000)),
+            Duration::from_nanos(16_666_666)
+        );
+        assert_eq!(
+            background_refresh_interval(Some(120_000)),
+            Duration::from_nanos(8_333_333)
+        );
+        assert_eq!(
+            background_refresh_interval(Some(0)),
+            background_refresh_interval(None)
+        );
+    }
+
+    #[test]
+    fn demand_tick_aligns_to_the_next_refresh_slot() {
+        let refresh_interval = Duration::from_millis(16);
+        assert_eq!(
+            next_background_frame_delay(None, refresh_interval),
+            refresh_interval
+        );
+        assert_eq!(
+            next_background_frame_delay(Some(Duration::from_millis(5)), refresh_interval),
+            Duration::from_millis(11)
+        );
+        assert_eq!(
+            next_background_frame_delay(Some(refresh_interval), refresh_interval),
+            refresh_interval
+        );
+        assert_eq!(
+            next_background_frame_delay(Some(Duration::from_millis(37)), refresh_interval),
+            Duration::from_millis(11)
+        );
+    }
+
+    #[test]
+    fn frame_pacing_policy_parser_is_explicit() {
+        assert_eq!("standard".parse(), Ok(BackgroundFramePacing::Standard));
+        assert_eq!("demand".parse(), Ok(BackgroundFramePacing::Demand));
+        assert!("realtime".parse::<BackgroundFramePacing>().is_err());
     }
 }
 

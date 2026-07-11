@@ -1,4 +1,4 @@
-use crate::{session, state::State, utils};
+use crate::{session, shell::BackgroundFramePacing, state::State, utils};
 use anyhow::{Context, Result, bail};
 use calloop::{LoopHandle, RegistrationToken};
 use futures_executor::ThreadPool;
@@ -24,6 +24,7 @@ pub struct LaunchRequest {
     pub argv: Vec<String>,
     pub cwd: String,
     pub env: HashMap<String, String>,
+    pub frame_pacing: BackgroundFramePacing,
     pub reply: mpsc::Sender<Result<LaunchReply, String>>,
 }
 
@@ -36,14 +37,14 @@ struct BackgroundLaunch {
     tx: calloop::channel::Sender<LaunchRequest>,
 }
 
-#[zbus::interface(name = "com.system76.CosmicComp.BackgroundLaunch1")]
 impl BackgroundLaunch {
-    async fn launch(
+    fn request_launch(
         &self,
         workspace_name: String,
         argv: Vec<String>,
         cwd: String,
         env: HashMap<String, String>,
+        frame_pacing: BackgroundFramePacing,
     ) -> zbus::fdo::Result<(u32, String)> {
         let (reply, rx) = mpsc::channel();
         self.tx
@@ -52,6 +53,7 @@ impl BackgroundLaunch {
                 argv,
                 cwd,
                 env,
+                frame_pacing,
                 reply,
             })
             .map_err(|err| zbus::fdo::Error::Failed(format!("compositor unavailable: {err}")))?;
@@ -62,6 +64,39 @@ impl BackgroundLaunch {
         reply
             .map(|reply| (reply.pid, reply.launch_id))
             .map_err(zbus::fdo::Error::Failed)
+    }
+}
+
+#[zbus::interface(name = "com.system76.CosmicComp.BackgroundLaunch1")]
+impl BackgroundLaunch {
+    async fn launch(
+        &self,
+        workspace_name: String,
+        argv: Vec<String>,
+        cwd: String,
+        env: HashMap<String, String>,
+    ) -> zbus::fdo::Result<(u32, String)> {
+        self.request_launch(
+            workspace_name,
+            argv,
+            cwd,
+            env,
+            BackgroundFramePacing::Standard,
+        )
+    }
+
+    async fn launch_with_options(
+        &self,
+        workspace_name: String,
+        argv: Vec<String>,
+        cwd: String,
+        env: HashMap<String, String>,
+        frame_pacing: String,
+    ) -> zbus::fdo::Result<(u32, String)> {
+        let frame_pacing = frame_pacing
+            .parse()
+            .map_err(zbus::fdo::Error::InvalidArgs)?;
+        self.request_launch(workspace_name, argv, cwd, env, frame_pacing)
     }
 }
 
@@ -85,11 +120,11 @@ pub fn init(evlh: &LoopHandle<'static, State>, executor: &ThreadPool) -> Result<
 }
 
 async fn serve(tx: calloop::channel::Sender<LaunchRequest>) -> zbus::Result<()> {
-    let conn = zbus::Connection::session().await?;
-    conn.object_server()
-        .at(OBJECT_PATH, BackgroundLaunch { tx })
+    let _connection = zbus::connection::Builder::session()?
+        .name(SERVICE_NAME)?
+        .serve_at(OBJECT_PATH, BackgroundLaunch { tx })?
+        .build()
         .await?;
-    conn.request_name(SERVICE_NAME).await?;
     std::future::pending::<()>().await;
     Ok(())
 }
@@ -102,6 +137,7 @@ impl State {
                 &request.argv,
                 &request.cwd,
                 &request.env,
+                request.frame_pacing,
             )
             .map_err(|err| err.to_string());
         let _ = request.reply.send(result);
@@ -113,6 +149,7 @@ impl State {
         argv: &[String],
         cwd: &str,
         env: &HashMap<String, String>,
+        frame_pacing: BackgroundFramePacing,
     ) -> Result<LaunchReply> {
         if workspace_name.trim().is_empty() {
             bail!("workspace name must not be empty");
@@ -163,6 +200,7 @@ impl State {
             launch_id.clone(),
             workspace_name.to_string(),
             pid,
+            frame_pacing,
             &mut self.common.workspace_state.update(),
         );
 

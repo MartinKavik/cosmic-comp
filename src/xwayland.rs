@@ -868,6 +868,9 @@ impl XwmHandler for State {
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
         let mut shell = self.common.shell.write();
+        let visible_output = window
+            .wl_surface()
+            .and_then(|surface| shell.visible_output_for_surface(&surface).cloned());
         if window.is_override_redirect() {
             shell.override_redirect_windows.retain(|or| or != &window);
         } else {
@@ -883,12 +886,8 @@ impl XwmHandler for State {
             }
         }
 
-        let outputs = if let Some(wl_surface) = window.wl_surface() {
-            shell
-                .visible_output_for_surface(&wl_surface)
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>()
+        let outputs = if window.wl_surface().is_some() {
+            visible_output.into_iter().collect::<Vec<_>>()
         } else {
             shell.outputs().cloned().collect::<Vec<_>>()
         };
@@ -1165,7 +1164,7 @@ impl XwmHandler for State {
         let seat = shell.seats.last_active().clone();
         let output = window
             .wl_surface()
-            .and_then(|surface| shell.visible_output_for_surface(&surface).cloned())
+            .and_then(|surface| shell.associated_output_for_surface(&surface))
             .unwrap_or_else(|| seat.focused_or_active_output());
 
         match shell.fullscreen_request(&window, output.clone(), &self.common.event_loop_handle) {

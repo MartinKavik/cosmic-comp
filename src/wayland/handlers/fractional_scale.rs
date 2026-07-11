@@ -42,8 +42,7 @@ impl FractionalScaleHandler for State {
                     self.common
                         .shell
                         .read()
-                        .visible_output_for_surface(&surface)
-                        .cloned()
+                        .associated_output_for_surface(&surface)
                 })
         })
         .unwrap_or_else(|| self.common.shell.read().seats.last_active().active_output());

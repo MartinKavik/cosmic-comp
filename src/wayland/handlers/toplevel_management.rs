@@ -184,7 +184,7 @@ impl ToplevelManagementHandler for State {
             .or_else(|| {
                 window
                     .wl_surface()
-                    .and_then(|surface| shell.visible_output_for_surface(&surface).cloned())
+                    .and_then(|surface| shell.associated_output_for_surface(&surface))
             })
             .unwrap_or_else(|| seat.focused_or_active_output());
         if let Some(target) =

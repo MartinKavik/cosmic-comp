@@ -259,11 +259,7 @@ impl XdgShellHandler for State {
         let output = output
             .as_ref()
             .and_then(Output::from_resource)
-            .or_else(|| {
-                shell
-                    .visible_output_for_surface(surface.wl_surface())
-                    .cloned()
-            })
+            .or_else(|| shell.associated_output_for_surface(surface.wl_surface()))
             .unwrap_or_else(|| seat.focused_or_active_output());
 
         match shell.fullscreen_request(&surface, output.clone(), &self.common.event_loop_handle) {
