@@ -7,6 +7,7 @@ use crate::{
     config::{Config, xkb_config_to_wl},
     input::{ModifiersShortcutQueue, SupressedButtons, SupressedKeys},
     state::State,
+    wayland::protocols::workspace::WorkspaceHandle,
 };
 use smithay::{
     backend::input::{Device, DeviceCapability},
@@ -35,6 +36,17 @@ crate::utils::id_gen!(next_seat_id, SEAT_ID, SEAT_IDS);
 pub struct Seats {
     seats: Vec<Seat<State>>,
     last_active: Option<Seat<State>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct IsolatedInputSeat {
+    pub launch_id: String,
+    pub name: String,
+    pub workspace: WorkspaceHandle,
+}
+
+pub fn isolated_input_seat(seat: &Seat<State>) -> Option<&IsolatedInputSeat> {
+    seat.user_data().get::<IsolatedInputSeat>()
 }
 
 impl Default for Seats {
@@ -86,6 +98,11 @@ impl Seats {
             devices.has_device(device)
         })
     }
+
+    pub fn isolated_named(&self, name: &str) -> Option<&Seat<State>> {
+        self.iter()
+            .find(|seat| isolated_input_seat(seat).is_some_and(|isolated| isolated.name == name))
+    }
 }
 
 impl Devices {
@@ -125,6 +142,14 @@ impl Devices {
 
     pub fn has_device<D: Device>(&self, device: &D) -> bool {
         self.capabilities.borrow().contains_key(&device.id())
+    }
+
+    pub fn len(&self) -> usize {
+        self.capabilities.borrow().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.capabilities.borrow().is_empty()
     }
 
     pub fn remove_device<D: Device>(&self, device: &D) -> Vec<DeviceCapability> {

@@ -29,6 +29,7 @@ use crate::{
         },
         focus::{FocusTarget, Stage, render_input_order, target::WindowGroup},
         grabs::{SeatMenuGrabState, SeatMoveGrabState},
+        isolated_input_seat,
         layout::tiling::ANIMATION_DURATION,
         zoom::ZoomState,
     },
@@ -792,6 +793,10 @@ where
 
     for seat in seats {
         seats_total += 1;
+        if isolated_input_seat(seat).is_some() {
+            seats_skipped += 1;
+            continue;
+        }
         let pointer = match seat.get_pointer() {
             Some(ptr) => ptr,
             None => continue,

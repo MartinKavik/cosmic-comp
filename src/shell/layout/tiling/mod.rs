@@ -81,6 +81,36 @@ pub const MINIMIZE_ANIMATION_DURATION: Duration = Duration::from_millis(320);
 pub const MOUSE_ANIMATION_DELAY: Duration = Duration::from_millis(150);
 pub const INITIAL_MOUSE_ANIMATION_DELAY: Duration = Duration::from_millis(500);
 
+fn retained_toplevel_contains(
+    tile: Rectangle<i32, Local>,
+    surface_bbox: Rectangle<i32, Logical>,
+    location: Point<i32, Local>,
+) -> bool {
+    tile.contains(location) && surface_bbox.contains((location - tile.loc).as_logical())
+}
+
+#[cfg(test)]
+mod retained_hit_test_tests {
+    use super::*;
+
+    #[test]
+    fn stale_surface_buffer_cannot_capture_a_neighboring_tile() {
+        let tile = Rectangle::<i32, Local>::new((0, 0).into(), (100, 100).into());
+        let stale_surface = Rectangle::<i32, Logical>::new((0, 0).into(), (200, 100).into());
+
+        assert!(retained_toplevel_contains(
+            tile,
+            stale_surface,
+            Point::<i32, Local>::from((50, 50))
+        ));
+        assert!(!retained_toplevel_contains(
+            tile,
+            stale_surface,
+            Point::<i32, Local>::from((150, 50))
+        ));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeDesc {
     pub handle: WorkspaceHandle,
@@ -3174,7 +3204,7 @@ impl TilingLayout {
         let location = location_f64.to_i32_round();
 
         for (mapped, geo) in self.mapped() {
-            if !mapped.bbox().contains((location - geo.loc).as_logical()) {
+            if !retained_toplevel_contains(geo, mapped.bbox(), location) {
                 continue;
             }
 
@@ -3234,7 +3264,7 @@ impl TilingLayout {
 
         if matches!(overview, OverviewMode::None) {
             for (mapped, geo) in self.mapped() {
-                if !mapped.bbox().contains((location - geo.loc).as_logical()) {
+                if !retained_toplevel_contains(geo, mapped.bbox(), location) {
                     continue;
                 }
                 if mapped.is_maximized(false) {

@@ -1079,6 +1079,23 @@ struct BackgroundLaunchContext {
     workspace_name: String,
     workspace_id: String,
     expires_at: Instant,
+    isolated_seat: Option<Seat<State>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BackgroundInputIsolationStatus {
+    pub seat_name: String,
+    pub device_count: usize,
+    pub isolated_pointer_x: f64,
+    pub isolated_pointer_y: f64,
+    pub physical_pointer_x: f64,
+    pub physical_pointer_y: f64,
+    pub workspace_active: bool,
+    pub mapped_surface_count: usize,
+    pub tiling_enabled: bool,
+    pub floating_window_count: usize,
+    pub tiled_window_count: usize,
+    pub maximized_window_count: usize,
 }
 
 #[derive(Debug, Default)]
@@ -5541,6 +5558,7 @@ impl Shell {
         workspace_name: String,
         root_pid: u32,
         frame_pacing: BackgroundFramePacing,
+        isolated_seat: Option<Seat<State>>,
         state: &mut WorkspaceUpdateGuard<'_, State>,
     ) {
         let workspace_id = background_launch_workspace_id(&workspace_name);
@@ -5551,6 +5569,7 @@ impl Shell {
                 workspace_name: workspace_name.clone(),
                 workspace_id: workspace_id.clone(),
                 expires_at: Instant::now() + BACKGROUND_LAUNCH_TIMEOUT,
+                isolated_seat,
             },
         );
         self.background_launches
@@ -5568,7 +5587,7 @@ impl Shell {
         let now = Instant::now();
         self.background_launches
             .contexts
-            .retain(|_, context| context.expires_at > now);
+            .retain(|_, context| context.isolated_seat.is_some() || context.expires_at > now);
         let active_workspace_ids = self
             .background_launches
             .contexts
@@ -5647,11 +5666,17 @@ impl Shell {
         evlh: &LoopHandle<'static, State>,
     ) -> Result<usize, String> {
         self.purge_expired_background_launches();
-        let (root_pid, workspace_name) = self
+        let (root_pid, workspace_name, isolated_seat) = self
             .background_launches
             .contexts
             .get(launch_id)
-            .map(|context| (context.root_pid, context.workspace_name.clone()))
+            .map(|context| {
+                (
+                    context.root_pid,
+                    context.workspace_name.clone(),
+                    context.isolated_seat.clone(),
+                )
+            })
             .ok_or_else(|| format!("unknown or expired background launch `{launch_id}`"))?;
         let target = self
             .ensure_background_launch_workspace(&workspace_name, workspace_state)
@@ -5707,14 +5732,141 @@ impl Shell {
             }
         }
 
-        let seat = self.seats.last_active().clone();
+        let seat = isolated_seat.unwrap_or_else(|| self.seats.last_active().clone());
         let workspace = self
             .workspaces
             .space_for_handle_mut(&target)
             .ok_or_else(|| format!("background workspace `{workspace_name}` disappeared"))?;
+        let maximized = workspace
+            .mapped()
+            .filter(|mapped| mapped.is_maximized(false))
+            .cloned()
+            .collect::<Vec<_>>();
+        for mapped in maximized {
+            workspace.unmaximize_request(&mapped);
+        }
         workspace.set_tiling(true, &seat, workspace_state);
+        workspace.recalculate();
         self.rebuild_surface_index();
         Ok(surfaces.len())
+    }
+
+    pub fn background_input_isolation_status(
+        &self,
+        launch_id: &str,
+    ) -> Result<BackgroundInputIsolationStatus, String> {
+        let context = self
+            .background_launches
+            .contexts
+            .get(launch_id)
+            .ok_or_else(|| format!("unknown background launch `{launch_id}`"))?;
+        let seat = context
+            .isolated_seat
+            .as_ref()
+            .ok_or_else(|| format!("background launch `{launch_id}` has no isolated input seat"))?;
+        let metadata = isolated_input_seat(seat).ok_or_else(|| {
+            format!("background launch `{launch_id}` lost isolated seat metadata")
+        })?;
+        if metadata.launch_id != launch_id {
+            return Err(format!(
+                "background launch `{launch_id}` has mismatched isolated seat metadata"
+            ));
+        }
+        let workspace = self
+            .workspaces
+            .space_for_handle(&metadata.workspace)
+            .ok_or_else(|| format!("background launch `{launch_id}` lost its workspace"))?;
+        let physical_seat = self
+            .seats
+            .iter()
+            .find(|candidate| isolated_input_seat(candidate).is_none())
+            .ok_or_else(|| "compositor has no physical input seat".to_string())?;
+        let isolated_pointer = seat
+            .get_pointer()
+            .ok_or_else(|| "isolated seat has no pointer".to_string())?
+            .current_location();
+        let physical_pointer = physical_seat
+            .get_pointer()
+            .ok_or_else(|| "physical seat has no pointer".to_string())?
+            .current_location();
+        let workspace_active = self
+            .workspaces
+            .active(workspace.output())
+            .is_some_and(|(_, active)| active.handle == workspace.handle);
+
+        Ok(BackgroundInputIsolationStatus {
+            seat_name: metadata.name.clone(),
+            device_count: seat.devices().len(),
+            isolated_pointer_x: isolated_pointer.x,
+            isolated_pointer_y: isolated_pointer.y,
+            physical_pointer_x: physical_pointer.x,
+            physical_pointer_y: physical_pointer.y,
+            workspace_active,
+            mapped_surface_count: workspace.mapped().count(),
+            tiling_enabled: workspace.tiling_enabled,
+            floating_window_count: workspace.floating_layer.mapped().count(),
+            tiled_window_count: workspace.tiling_layer.mapped().count(),
+            maximized_window_count: workspace
+                .mapped()
+                .filter(|mapped| mapped.is_maximized(false))
+                .count(),
+        })
+    }
+
+    pub fn release_background_launch(
+        &mut self,
+        launch_id: &str,
+        display_handle: &DisplayHandle,
+    ) -> Result<(), String> {
+        let Some(context) = self.background_launches.contexts.remove(launch_id) else {
+            return Ok(());
+        };
+
+        if let Some(seat) = context.isolated_seat {
+            self.seats.remove_seat(&seat);
+            if let Some(global) = seat.global() {
+                display_handle.remove_global::<State>(global);
+            }
+        }
+
+        let workspace_still_used = self
+            .background_launches
+            .contexts
+            .values()
+            .any(|other| other.workspace_id == context.workspace_id);
+        if !workspace_still_used {
+            self.background_launches
+                .workspaces
+                .remove(&context.workspace_id);
+            if let Some(workspace) = self
+                .workspaces
+                .spaces_mut()
+                .find(|workspace| workspace.id.as_deref() == Some(context.workspace_id.as_str()))
+            {
+                workspace.keep_alive = false;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn release_background_launch_for_root_pid(
+        &mut self,
+        root_pid: u32,
+        display_handle: &DisplayHandle,
+    ) -> Result<bool, String> {
+        let launch_id =
+            self.background_launches
+                .contexts
+                .iter()
+                .find_map(|(launch_id, context)| {
+                    (context.root_pid == root_pid && context.isolated_seat.is_some())
+                        .then(|| launch_id.clone())
+                });
+        let Some(launch_id) = launch_id else {
+            return Ok(false);
+        };
+        self.release_background_launch(&launch_id, display_handle)?;
+        Ok(true)
     }
 
     pub fn is_background_launch_surface(&self, surface: &WlSurface) -> bool {

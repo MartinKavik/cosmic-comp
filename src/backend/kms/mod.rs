@@ -316,15 +316,31 @@ fn init_libinput(
     let libinput_backend = LibinputInputBackend::new(libinput_context.clone());
 
     evlh.insert_source(libinput_backend, move |mut event, _, state| {
+        let mut reassigned = false;
         if let InputEvent::DeviceAdded { device } = &mut event {
-            state.common.config.read_device(device);
-            state
-                .backend
-                .kms()
-                .input_devices
-                .insert(device.name().into(), device.clone());
+            if let Some(seat_name) =
+                crate::input::isolated_seat_name_for_device(device.name()).map(str::to_owned)
+                && device.seat().logical_name() != seat_name
+            {
+                if device.set_seat_logical_name(&seat_name).is_ok() {
+                    reassigned = true;
+                } else {
+                    warn!(?seat_name, "Failed to assign isolated logical input seat");
+                }
+            }
+            if !reassigned {
+                state.common.config.read_device(device);
+                state
+                    .backend
+                    .kms()
+                    .input_devices
+                    .insert(device.name().into(), device.clone());
+            }
         } else if let InputEvent::DeviceRemoved { device } = &event {
             state.backend.kms().input_devices.remove(device.name());
+        }
+        if reassigned {
+            return;
         }
         let redraw_scope = input_redraw_scope(&event);
 

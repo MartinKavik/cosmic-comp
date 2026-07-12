@@ -1,4 +1,9 @@
-use crate::{session, shell::BackgroundFramePacing, state::State, utils};
+use crate::{
+    session,
+    shell::{BackgroundFramePacing, IsolatedInputSeat, create_seat},
+    state::State,
+    utils,
+};
 use anyhow::{Context, Result, bail};
 use calloop::{LoopHandle, RegistrationToken};
 use futures_executor::ThreadPool;
@@ -25,6 +30,7 @@ pub struct LaunchRequest {
     pub cwd: String,
     pub env: HashMap<String, String>,
     pub frame_pacing: BackgroundFramePacing,
+    pub isolated_input: bool,
     pub reply: mpsc::Sender<Result<LaunchReply, String>>,
 }
 
@@ -33,15 +39,43 @@ pub struct ReconcileRequest {
     pub reply: mpsc::Sender<Result<u32, String>>,
 }
 
+pub struct IsolationStatusRequest {
+    pub launch_id: String,
+    pub reply: mpsc::Sender<Result<IsolationStatusReply, String>>,
+}
+
+pub struct ReleaseRequest {
+    pub launch_id: String,
+    pub reply: mpsc::Sender<Result<(), String>>,
+}
+
 pub enum BackgroundRequest {
     Launch(LaunchRequest),
     Reconcile(ReconcileRequest),
+    IsolationStatus(IsolationStatusRequest),
+    Release(ReleaseRequest),
 }
 
 pub struct LaunchReply {
     pub pid: u32,
     pub launch_id: String,
+    pub isolated_seat_name: Option<String>,
 }
+
+pub type IsolationStatusReply = (
+    String,
+    u32,
+    f64,
+    f64,
+    f64,
+    f64,
+    bool,
+    u32,
+    bool,
+    u32,
+    u32,
+    u32,
+);
 
 struct BackgroundLaunch {
     tx: calloop::channel::Sender<BackgroundRequest>,
@@ -55,6 +89,7 @@ impl BackgroundLaunch {
         cwd: String,
         env: HashMap<String, String>,
         frame_pacing: BackgroundFramePacing,
+        isolated_input: bool,
     ) -> zbus::fdo::Result<(u32, String)> {
         let (reply, rx) = mpsc::channel();
         self.tx
@@ -64,6 +99,7 @@ impl BackgroundLaunch {
                 cwd,
                 env,
                 frame_pacing,
+                isolated_input,
                 reply,
             }))
             .map_err(|err| zbus::fdo::Error::Failed(format!("compositor unavailable: {err}")))?;
@@ -92,6 +128,7 @@ impl BackgroundLaunch {
             cwd,
             env,
             BackgroundFramePacing::Standard,
+            false,
         )
     }
 
@@ -106,7 +143,40 @@ impl BackgroundLaunch {
         let frame_pacing = frame_pacing
             .parse()
             .map_err(zbus::fdo::Error::InvalidArgs)?;
-        self.request_launch(workspace_name, argv, cwd, env, frame_pacing)
+        self.request_launch(workspace_name, argv, cwd, env, frame_pacing, false)
+    }
+
+    async fn launch_isolated(
+        &self,
+        workspace_name: String,
+        argv: Vec<String>,
+        cwd: String,
+        env: HashMap<String, String>,
+        frame_pacing: String,
+    ) -> zbus::fdo::Result<(u32, String, String)> {
+        let frame_pacing = frame_pacing
+            .parse()
+            .map_err(zbus::fdo::Error::InvalidArgs)?;
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(BackgroundRequest::Launch(LaunchRequest {
+                workspace_name,
+                argv,
+                cwd,
+                env,
+                frame_pacing,
+                isolated_input: true,
+                reply,
+            }))
+            .map_err(|err| zbus::fdo::Error::Failed(format!("compositor unavailable: {err}")))?;
+        let reply = rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|err| zbus::fdo::Error::Failed(format!("launch timed out: {err}")))?
+            .map_err(zbus::fdo::Error::Failed)?;
+        let seat_name = reply.isolated_seat_name.ok_or_else(|| {
+            zbus::fdo::Error::Failed("isolated launch omitted its seat name".to_string())
+        })?;
+        Ok((reply.pid, reply.launch_id, seat_name))
     }
 
     async fn reconcile(&self, launch_id: String) -> zbus::fdo::Result<u32> {
@@ -126,6 +196,42 @@ impl BackgroundLaunch {
             .map_err(|err| zbus::fdo::Error::Failed(format!("reconcile timed out: {err}")))?
             .map_err(zbus::fdo::Error::Failed)
     }
+
+    async fn isolation_status(&self, launch_id: String) -> zbus::fdo::Result<IsolationStatusReply> {
+        if launch_id.trim().is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "launch ID must not be empty".to_string(),
+            ));
+        }
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(BackgroundRequest::IsolationStatus(IsolationStatusRequest {
+                launch_id,
+                reply,
+            }))
+            .map_err(|err| zbus::fdo::Error::Failed(format!("compositor unavailable: {err}")))?;
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|err| zbus::fdo::Error::Failed(format!("status timed out: {err}")))?
+            .map_err(zbus::fdo::Error::Failed)
+    }
+
+    async fn release(&self, launch_id: String) -> zbus::fdo::Result<()> {
+        if launch_id.trim().is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "launch ID must not be empty".to_string(),
+            ));
+        }
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(BackgroundRequest::Release(ReleaseRequest {
+                launch_id,
+                reply,
+            }))
+            .map_err(|err| zbus::fdo::Error::Failed(format!("compositor unavailable: {err}")))?;
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|err| zbus::fdo::Error::Failed(format!("release timed out: {err}")))?
+            .map_err(zbus::fdo::Error::Failed)
+    }
 }
 
 pub fn init(evlh: &LoopHandle<'static, State>, executor: &ThreadPool) -> Result<RegistrationToken> {
@@ -137,6 +243,12 @@ pub fn init(evlh: &LoopHandle<'static, State>, executor: &ThreadPool) -> Result<
             }
             calloop::channel::Event::Msg(BackgroundRequest::Reconcile(request)) => {
                 state.handle_background_reconcile(request)
+            }
+            calloop::channel::Event::Msg(BackgroundRequest::IsolationStatus(request)) => {
+                state.handle_background_isolation_status(request)
+            }
+            calloop::channel::Event::Msg(BackgroundRequest::Release(request)) => {
+                state.handle_background_release(request)
             }
             calloop::channel::Event::Closed => (),
         })
@@ -171,6 +283,7 @@ impl State {
                 &request.cwd,
                 &request.env,
                 request.frame_pacing,
+                request.isolated_input,
             )
             .map_err(|err| err.to_string());
         let _ = request.reply.send(result);
@@ -191,6 +304,40 @@ impl State {
         let _ = request.reply.send(result);
     }
 
+    pub fn handle_background_isolation_status(&mut self, request: IsolationStatusRequest) {
+        let result = self
+            .common
+            .shell
+            .read()
+            .background_input_isolation_status(&request.launch_id)
+            .map(|status| {
+                (
+                    status.seat_name,
+                    u32::try_from(status.device_count).unwrap_or(u32::MAX),
+                    status.isolated_pointer_x,
+                    status.isolated_pointer_y,
+                    status.physical_pointer_x,
+                    status.physical_pointer_y,
+                    status.workspace_active,
+                    u32::try_from(status.mapped_surface_count).unwrap_or(u32::MAX),
+                    status.tiling_enabled,
+                    u32::try_from(status.floating_window_count).unwrap_or(u32::MAX),
+                    u32::try_from(status.tiled_window_count).unwrap_or(u32::MAX),
+                    u32::try_from(status.maximized_window_count).unwrap_or(u32::MAX),
+                )
+            });
+        let _ = request.reply.send(result);
+    }
+
+    pub fn handle_background_release(&mut self, request: ReleaseRequest) {
+        let result = self
+            .common
+            .shell
+            .write()
+            .release_background_launch(&request.launch_id, &self.common.display_handle);
+        let _ = request.reply.send(result);
+    }
+
     fn launch_background_app(
         &mut self,
         workspace_name: &str,
@@ -198,6 +345,7 @@ impl State {
         cwd: &str,
         env: &HashMap<String, String>,
         frame_pacing: BackgroundFramePacing,
+        isolated_input: bool,
     ) -> Result<LaunchReply> {
         if workspace_name.trim().is_empty() {
             bail!("workspace name must not be empty");
@@ -213,13 +361,48 @@ impl State {
             NEXT_LAUNCH_ID.fetch_add(1, Ordering::Relaxed)
         );
 
-        {
+        let (workspace_handle, output) = {
             let mut shell = self.common.shell.write();
-            let _ = shell.ensure_background_launch_workspace(
-                workspace_name,
-                &mut self.common.workspace_state.update(),
+            let workspace_handle = shell
+                .ensure_background_launch_workspace(
+                    workspace_name,
+                    &mut self.common.workspace_state.update(),
+                )
+                .context("background workspace has no output")?;
+            let output = shell
+                .workspaces
+                .space_for_handle(&workspace_handle)
+                .context("background workspace disappeared")?
+                .output
+                .clone();
+            (workspace_handle, output)
+        };
+
+        let isolated_seat = isolated_input.then(|| {
+            let name = format!("cosmic-isolated-{}", launch_id);
+            let seat = create_seat(
+                &self.common.display_handle,
+                &mut self.common.seat_state,
+                &output,
+                &self.common.config,
+                name.clone(),
             );
-        }
+            seat.user_data()
+                .insert_if_missing_threadsafe(|| IsolatedInputSeat {
+                    launch_id: launch_id.clone(),
+                    name,
+                    workspace: workspace_handle,
+                });
+            self.common.shell.write().seats.add_seat(seat.clone());
+            seat
+        });
+        let isolated_seat_name = isolated_seat.as_ref().map(|seat| {
+            seat.user_data()
+                .get::<IsolatedInputSeat>()
+                .expect("isolated seat metadata")
+                .name
+                .clone()
+        });
 
         let mut command = process::Command::new(program);
         command.args(args);
@@ -231,6 +414,9 @@ impl State {
         command.env("COSMIC_BACKGROUND_LAUNCH_ID", &launch_id);
         command.env("XDG_ACTIVATION_TOKEN", &launch_id);
         command.env("DESKTOP_STARTUP_ID", &launch_id);
+        if let Some(seat_name) = &isolated_seat_name {
+            command.env("APP_WINDOW_WAYLAND_SEAT", seat_name);
+        }
         unsafe {
             command.pre_exec(|| {
                 utils::rlimit::restore_nofile_limit();
@@ -238,9 +424,18 @@ impl State {
             })
         };
 
-        let child = command
-            .spawn()
-            .with_context(|| format!("failed to spawn {program:?}"))?;
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(seat) = &isolated_seat {
+                    self.common.shell.write().seats.remove_seat(seat);
+                    if let Some(global) = seat.global() {
+                        self.common.display_handle.remove_global::<State>(global);
+                    }
+                }
+                return Err(error).with_context(|| format!("failed to spawn {program:?}"));
+            }
+        };
         let pid = child.id();
         self.common.background_launch_children.push(child);
 
@@ -249,9 +444,14 @@ impl State {
             workspace_name.to_string(),
             pid,
             frame_pacing,
+            isolated_seat,
             &mut self.common.workspace_state.update(),
         );
 
-        Ok(LaunchReply { pid, launch_id })
+        Ok(LaunchReply {
+            pid,
+            launch_id,
+            isolated_seat_name,
+        })
     }
 }

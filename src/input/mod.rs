@@ -17,6 +17,7 @@ use crate::{
             target::{KeyboardFocusTarget, PointerFocusTarget},
         },
         grabs::{ReleaseMode, ResizeEdge},
+        isolated_input_seat,
         layout::{
             floating::ResizeGrabMarker,
             tiling::{NodeDesc, SwapWindowGrab, TilingLayout},
@@ -61,6 +62,7 @@ use smithay::{
     },
     utils::{Point, Rectangle, SERIAL_COUNTER, Serial},
     wayland::{
+        idle_notify::IdleNotifierState,
         image_copy_capture::{BufferConstraints, CursorSessionRef},
         keyboard_shortcuts_inhibit::KeyboardShortcutsInhibitorSeat,
         pointer_constraints::{PointerConstraint, with_pointer_constraint},
@@ -70,6 +72,39 @@ use smithay::{
 };
 use tracing::{error, trace, warn};
 use xkbcommon::xkb::{Keycode, Keysym};
+
+const ISOLATED_DEVICE_PREFIX: &str = "COSMIC Isolated ";
+
+pub(crate) fn isolated_seat_name_for_device(device_name: &str) -> Option<&str> {
+    let value = device_name.strip_prefix(ISOLATED_DEVICE_PREFIX)?;
+    let (seat_name, kind) = value.rsplit_once(' ')?;
+    matches!(kind, "Pointer" | "Keyboard").then_some(seat_name)
+}
+
+fn is_isolated_input_device<D: Device + 'static>(device: &D) -> bool {
+    <dyn Any>::downcast_ref::<InputDevice>(device)
+        .and_then(|device| isolated_seat_name_for_device(device.name()))
+        .is_some()
+}
+
+fn notify_input_activity(state: &mut IdleNotifierState<State>, seat: &Seat<State>) {
+    if isolated_input_seat(seat).is_none() {
+        state.notify_activity(seat);
+    }
+}
+
+fn seat_accepts_input(shell: &Shell, seat: &Seat<State>) -> bool {
+    let Some(isolated) = isolated_input_seat(seat) else {
+        return true;
+    };
+    let Some(workspace) = shell.workspaces.space_for_handle(&isolated.workspace) else {
+        return false;
+    };
+    !shell
+        .workspaces
+        .active(workspace.output())
+        .is_some_and(|(_, active)| active.handle == workspace.handle)
+}
 
 use std::{
     any::Any,
@@ -164,13 +199,57 @@ impl State {
     where
         <B as InputBackend>::Device: 'static,
     {
-        crate::wayland::handlers::output_power::set_all_surfaces_dpms_on(self);
-
         use smithay::backend::input::Event;
+
+        let isolated_device = match &event {
+            InputEvent::DeviceAdded { device } | InputEvent::DeviceRemoved { device } => {
+                is_isolated_input_device(device)
+            }
+            InputEvent::Keyboard { event } => is_isolated_input_device(&event.device()),
+            InputEvent::PointerMotion { event } => is_isolated_input_device(&event.device()),
+            InputEvent::PointerMotionAbsolute { event } => {
+                is_isolated_input_device(&event.device())
+            }
+            InputEvent::PointerButton { event } => is_isolated_input_device(&event.device()),
+            InputEvent::PointerAxis { event } => is_isolated_input_device(&event.device()),
+            InputEvent::GestureSwipeBegin { event } => is_isolated_input_device(&event.device()),
+            InputEvent::GestureSwipeUpdate { event } => is_isolated_input_device(&event.device()),
+            InputEvent::GestureSwipeEnd { event } => is_isolated_input_device(&event.device()),
+            InputEvent::GesturePinchBegin { event } => is_isolated_input_device(&event.device()),
+            InputEvent::GesturePinchUpdate { event } => is_isolated_input_device(&event.device()),
+            InputEvent::GesturePinchEnd { event } => is_isolated_input_device(&event.device()),
+            InputEvent::GestureHoldBegin { event } => is_isolated_input_device(&event.device()),
+            InputEvent::GestureHoldEnd { event } => is_isolated_input_device(&event.device()),
+            InputEvent::TouchDown { event } => is_isolated_input_device(&event.device()),
+            InputEvent::TouchMotion { event } => is_isolated_input_device(&event.device()),
+            InputEvent::TouchUp { event } => is_isolated_input_device(&event.device()),
+            InputEvent::TouchCancel { event } => is_isolated_input_device(&event.device()),
+            InputEvent::TouchFrame { event } => is_isolated_input_device(&event.device()),
+            InputEvent::TabletToolAxis { event } => is_isolated_input_device(&event.device()),
+            InputEvent::TabletToolProximity { event } => is_isolated_input_device(&event.device()),
+            InputEvent::TabletToolTip { event } => is_isolated_input_device(&event.device()),
+            InputEvent::TabletToolButton { event } => is_isolated_input_device(&event.device()),
+            InputEvent::SwitchToggle { event } => is_isolated_input_device(&event.device()),
+            InputEvent::Special(_) => false,
+        };
+        if !isolated_device {
+            crate::wayland::handlers::output_power::set_all_surfaces_dpms_on(self);
+        }
+
         match event {
             InputEvent::DeviceAdded { device } => {
                 let shell = self.common.shell.read();
-                let seat = shell.seats.last_active();
+                let isolated_name = <dyn Any>::downcast_ref::<InputDevice>(&device)
+                    .and_then(|device| isolated_seat_name_for_device(device.name()));
+                let seat = if let Some(name) = isolated_name {
+                    let Some(seat) = shell.seats.isolated_named(name) else {
+                        warn!(?name, "Ignoring input device for an unknown isolated seat");
+                        return;
+                    };
+                    seat
+                } else {
+                    shell.seats.last_active()
+                };
                 let led_state = seat.get_keyboard().unwrap().led_state();
                 seat.devices().add_device(&device, led_state);
                 if device.has_capability(DeviceCapability::TabletTool) {
@@ -208,8 +287,9 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
-
+                    if !seat_accepts_input(&self.common.shell.read(), &seat) {
+                        return;
+                    }
                     let keycode = event.key_code();
                     let state = event.state();
                     trace!(?keycode, ?state, "key");
@@ -217,6 +297,14 @@ impl State {
                     let serial = SERIAL_COUNTER.next_serial();
                     let time = Event::time_msec(&event);
                     let keyboard = seat.get_keyboard().unwrap();
+                    if isolated_input_seat(&seat).is_some() {
+                        keyboard.input(self, keycode, state, serial, time, |_, _, _| {
+                            FilterResult::<()>::Forward
+                        });
+                        return;
+                    }
+
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let previous_modifiers = keyboard.modifier_state();
                     if let Some((action, pattern)) = keyboard
                         .input(
@@ -307,13 +395,20 @@ impl State {
 
                 let shell = self.common.shell.write();
                 if let Some(seat) = shell.seats.for_device(&event.device()).cloned() {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    if !seat_accepts_input(&shell, &seat) {
+                        return;
+                    }
+                    let isolated = isolated_input_seat(&seat).is_some();
+                    if !isolated {
+                        notify_input_activity(&mut self.common.idle_notifier_state, &seat);
+                    }
                     let current_output = seat.active_output();
 
                     let mut position = seat.get_pointer().unwrap().current_location().as_global();
 
-                    let under = State::surface_under(position, &current_output, &shell)
-                        .map(|(target, pos)| (target, pos.as_logical()));
+                    let under =
+                        State::surface_under_for_seat(position, &current_output, &shell, &seat)
+                            .map(|(target, pos)| (target, pos.as_logical()));
 
                     let ptr = seat.get_pointer().unwrap();
 
@@ -350,11 +445,15 @@ impl State {
                     let original_position = position;
                     position += event.delta().as_global();
 
-                    let output = shell
-                        .outputs()
-                        .find(|output| output.geometry().to_f64().contains(position))
-                        .cloned()
-                        .unwrap_or(current_output.clone());
+                    let output = if isolated {
+                        current_output.clone()
+                    } else {
+                        shell
+                            .outputs()
+                            .find(|output| output.geometry().to_f64().contains(position))
+                            .cloned()
+                            .unwrap_or(current_output.clone())
+                    };
 
                     let output_geometry = output.geometry();
                     position.x = position.x.clamp(
@@ -366,7 +465,7 @@ impl State {
                         (output_geometry.loc.y + output_geometry.size.h - 1) as f64,
                     );
 
-                    let new_under = State::surface_under(position, &output, &shell)
+                    let new_under = State::surface_under_for_seat(position, &output, &shell, &seat)
                         .map(|(target, pos)| (target, pos.as_logical()));
 
                     std::mem::drop(shell);
@@ -397,7 +496,7 @@ impl State {
                             return;
                         }
                         //If the pointer isn't grabbed, we should check if the focused element should be updated
-                    } else if self.common.config.cosmic_conf.focus_follows_cursor {
+                    } else if !isolated && self.common.config.cosmic_conf.focus_follows_cursor {
                         let shell = self.common.shell.read();
                         let old_keyboard_target =
                             State::element_under(original_position, &current_output, &shell, &seat);
@@ -570,43 +669,45 @@ impl State {
                         });
                     }
 
-                    let mut shell = self.common.shell.write();
-                    shell.update_pointer_position(position.to_local(&output), &output);
-                    shell.update_focal_point(
-                        &seat,
-                        original_position,
-                        self.common.config.cosmic_conf.accessibility_zoom.view_moves,
-                    );
+                    if !isolated {
+                        let mut shell = self.common.shell.write();
+                        shell.update_pointer_position(position.to_local(&output), &output);
+                        shell.update_focal_point(
+                            &seat,
+                            original_position,
+                            self.common.config.cosmic_conf.accessibility_zoom.view_moves,
+                        );
 
-                    if output != current_output {
-                        for session in cursor_sessions_for_output(&shell, &current_output) {
-                            session.set_cursor_pos(None);
-                        }
-                        seat.set_active_output(&output);
-                    }
-
-                    for session in cursor_sessions_for_output(&shell, &output) {
-                        if let Some((geometry, offset)) = seat.cursor_geometry(
-                            position.as_logical().to_buffer(
-                                output.current_scale().fractional_scale(),
-                                output.current_transform(),
-                                &output_geometry.size.to_f64().as_logical(),
-                            ),
-                            self.common.clock.now(),
-                        ) {
-                            if session
-                                .current_constraints()
-                                .map(|constraint| constraint.size != geometry.size)
-                                .unwrap_or(true)
-                            {
-                                session.update_constraints(BufferConstraints {
-                                    size: geometry.size,
-                                    shm: vec![ShmFormat::Argb8888],
-                                    dma: None,
-                                });
+                        if output != current_output {
+                            for session in cursor_sessions_for_output(&shell, &current_output) {
+                                session.set_cursor_pos(None);
                             }
-                            session.set_cursor_hotspot(offset);
-                            session.set_cursor_pos(Some(geometry.loc));
+                            seat.set_active_output(&output);
+                        }
+
+                        for session in cursor_sessions_for_output(&shell, &output) {
+                            if let Some((geometry, offset)) = seat.cursor_geometry(
+                                position.as_logical().to_buffer(
+                                    output.current_scale().fractional_scale(),
+                                    output.current_transform(),
+                                    &output_geometry.size.to_f64().as_logical(),
+                                ),
+                                self.common.clock.now(),
+                            ) {
+                                if session
+                                    .current_constraints()
+                                    .map(|constraint| constraint.size != geometry.size)
+                                    .unwrap_or(true)
+                                {
+                                    session.update_constraints(BufferConstraints {
+                                        size: geometry.size,
+                                        shm: vec![ShmFormat::Argb8888],
+                                        dma: None,
+                                    });
+                                }
+                                session.set_cursor_hotspot(offset);
+                                session.set_cursor_pos(Some(geometry.loc));
+                            }
                         }
                     }
                 }
@@ -620,7 +721,13 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    if !seat_accepts_input(&self.common.shell.read(), &seat) {
+                        return;
+                    }
+                    let isolated = isolated_input_seat(&seat).is_some();
+                    if !isolated {
+                        notify_input_activity(&mut self.common.idle_notifier_state, &seat);
+                    }
                     let output = seat.active_output();
                     let geometry = output.geometry();
                     let position = geometry.loc.to_f64()
@@ -630,8 +737,13 @@ impl State {
                         )
                         .as_global();
                     let serial = SERIAL_COUNTER.next_serial();
-                    let under = State::surface_under(position, &output, &self.common.shell.write())
-                        .map(|(target, pos)| (target, pos.as_logical()));
+                    let under = State::surface_under_for_seat(
+                        position,
+                        &output,
+                        &self.common.shell.read(),
+                        &seat,
+                    )
+                    .map(|(target, pos)| (target, pos.as_logical()));
 
                     let ptr = seat.get_pointer().unwrap();
                     ptr.motion(
@@ -645,29 +757,31 @@ impl State {
                     );
                     ptr.frame(self);
 
-                    let shell = self.common.shell.read();
-                    for session in cursor_sessions_for_output(&shell, &output) {
-                        if let Some((geometry, offset)) = seat.cursor_geometry(
-                            position.as_logical().to_buffer(
-                                output.current_scale().fractional_scale(),
-                                output.current_transform(),
-                                &geometry.size.to_f64().as_logical(),
-                            ),
-                            self.common.clock.now(),
-                        ) {
-                            if session
-                                .current_constraints()
-                                .map(|constraint| constraint.size != geometry.size)
-                                .unwrap_or(true)
-                            {
-                                session.update_constraints(BufferConstraints {
-                                    size: geometry.size,
-                                    shm: vec![ShmFormat::Argb8888],
-                                    dma: None,
-                                });
+                    if !isolated {
+                        let shell = self.common.shell.read();
+                        for session in cursor_sessions_for_output(&shell, &output) {
+                            if let Some((geometry, offset)) = seat.cursor_geometry(
+                                position.as_logical().to_buffer(
+                                    output.current_scale().fractional_scale(),
+                                    output.current_transform(),
+                                    &geometry.size.to_f64().as_logical(),
+                                ),
+                                self.common.clock.now(),
+                            ) {
+                                if session
+                                    .current_constraints()
+                                    .map(|constraint| constraint.size != geometry.size)
+                                    .unwrap_or(true)
+                                {
+                                    session.update_constraints(BufferConstraints {
+                                        size: geometry.size,
+                                        shm: vec![ShmFormat::Argb8888],
+                                        dma: None,
+                                    });
+                                }
+                                session.set_cursor_hotspot(offset);
+                                session.set_cursor_pos(Some(geometry.loc));
                             }
-                            session.set_cursor_hotspot(offset);
-                            session.set_cursor_pos(Some(geometry.loc));
                         }
                     }
                 }
@@ -686,7 +800,13 @@ impl State {
                 else {
                     return;
                 };
-                self.common.idle_notifier_state.notify_activity(&seat);
+                if !seat_accepts_input(&self.common.shell.read(), &seat) {
+                    return;
+                }
+                let isolated = isolated_input_seat(&seat).is_some();
+                if !isolated {
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
+                }
 
                 let current_focus = seat.get_keyboard().unwrap().current_focus();
                 let shortcuts_inhibited = current_focus.as_ref().is_some_and(|f| {
@@ -716,10 +836,11 @@ impl State {
                             seat.get_pointer().unwrap().current_location().as_global();
                         let under = {
                             let shell = self.common.shell.read();
-                            State::element_under(global_position, &output, &shell, &seat)
+                            State::element_under_for_seat(global_position, &output, &shell, &seat)
                         };
                         if let Some(target) = under {
                             if let Some(surface) = target.toplevel().map(Cow::into_owned)
+                                && !isolated
                                 && seat.get_keyboard().unwrap().modifier_state().logo
                                 && !shortcuts_inhibited
                             {
@@ -842,7 +963,7 @@ impl State {
                             Shell::set_focus(self, Some(&target), &seat, Some(serial), false);
                         }
                     }
-                } else {
+                } else if !isolated {
                     let mut shell = self.common.shell.write();
                     if let Some(Trigger::Pointer(action_button)) =
                         shell.overview_mode().0.active_trigger()
@@ -853,7 +974,8 @@ impl State {
                     std::mem::drop(shell);
                 };
 
-                if pass_event
+                if !isolated
+                    && pass_event
                     && !matches!(current_focus, Some(KeyboardFocusTarget::LockSurface(_)))
                     && !shortcuts_inhibited
                 {
@@ -897,9 +1019,16 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    if !seat_accepts_input(&self.common.shell.read(), &seat) {
+                        return;
+                    }
+                    let isolated = isolated_input_seat(&seat).is_some();
+                    if !isolated {
+                        notify_input_activity(&mut self.common.idle_notifier_state, &seat);
+                    }
 
-                    if seat.get_keyboard().unwrap().modifier_state().logo
+                    if !isolated
+                        && seat.get_keyboard().unwrap().modifier_state().logo
                         && self
                             .common
                             .config
@@ -967,7 +1096,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     if event.fingers() >= 3 && !workspace_overview_is_open(&seat.active_output()) {
                         self.common.gesture_state = Some(GestureState::new(event.fingers()));
                     } else {
@@ -993,7 +1122,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let mut activate_action: Option<SwipeAction> = None;
                     if let Some(ref mut gesture_state) = self.common.gesture_state {
                         let first_update = gesture_state.update(
@@ -1094,7 +1223,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     if let Some(ref gesture_state) = self.common.gesture_state {
                         match gesture_state.action {
                             Some(SwipeAction::NextWorkspace) | Some(SwipeAction::PrevWorkspace) => {
@@ -1139,7 +1268,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let serial = SERIAL_COUNTER.next_serial();
                     let pointer = seat.get_pointer().unwrap();
                     pointer.gesture_pinch_begin(
@@ -1161,7 +1290,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let pointer = seat.get_pointer().unwrap();
                     pointer.gesture_pinch_update(
                         self,
@@ -1183,7 +1312,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let serial = SERIAL_COUNTER.next_serial();
                     let pointer = seat.get_pointer().unwrap();
                     pointer.gesture_pinch_end(
@@ -1205,7 +1334,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let serial = SERIAL_COUNTER.next_serial();
                     let pointer = seat.get_pointer().unwrap();
                     pointer.gesture_hold_begin(
@@ -1227,7 +1356,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let serial = SERIAL_COUNTER.next_serial();
                     let pointer = seat.get_pointer().unwrap();
                     pointer.gesture_hold_end(
@@ -1244,7 +1373,7 @@ impl State {
             InputEvent::TouchDown { event, .. } => {
                 let shell = self.common.shell.write();
                 if let Some(seat) = shell.seats.for_device(&event.device()).cloned() {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let Some(output) =
                         mapped_output_for_device(&self.common.config, &shell, &event.device())
                             .cloned()
@@ -1276,7 +1405,7 @@ impl State {
             InputEvent::TouchMotion { event, .. } => {
                 let shell = self.common.shell.write();
                 if let Some(seat) = shell.seats.for_device(&event.device()).cloned() {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let Some(output) =
                         mapped_output_for_device(&self.common.config, &shell, &event.device())
                             .cloned()
@@ -1313,7 +1442,7 @@ impl State {
 
                 let maybe_seat = shell.seats.for_device(&event.device()).cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     std::mem::drop(shell);
                     let serial = SERIAL_COUNTER.next_serial();
                     let touch = seat.get_touch().unwrap();
@@ -1336,7 +1465,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let touch = seat.get_touch().unwrap();
                     touch.cancel(self);
                 }
@@ -1350,7 +1479,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let touch = seat.get_touch().unwrap();
                     touch.frame(self);
                 }
@@ -1359,7 +1488,7 @@ impl State {
             InputEvent::TabletToolAxis { event, .. } => {
                 let shell = self.common.shell.write();
                 if let Some(seat) = shell.seats.for_device(&event.device()).cloned() {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let Some(output) =
                         mapped_output_for_device(&self.common.config, &shell, &event.device())
                             .cloned()
@@ -1424,7 +1553,7 @@ impl State {
             InputEvent::TabletToolProximity { event, .. } => {
                 let shell = self.common.shell.write();
                 if let Some(seat) = shell.seats.for_device(&event.device()).cloned() {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     let Some(output) =
                         mapped_output_for_device(&self.common.config, &shell, &event.device())
                             .cloned()
@@ -1485,7 +1614,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     if let Some(tool) = seat.tablet_seat().get_tool(&event.tool()) {
                         match event.tip_state() {
                             TabletToolTipState::Down => {
@@ -1507,7 +1636,7 @@ impl State {
                     .for_device(&event.device())
                     .cloned();
                 if let Some(seat) = maybe_seat {
-                    self.common.idle_notifier_state.notify_activity(&seat);
+                    notify_input_activity(&mut self.common.idle_notifier_state, &seat);
                     if let Some(tool) = seat.tablet_seat().get_tool(&event.tool()) {
                         tool.button(
                             event.button(),
@@ -2018,6 +2147,37 @@ impl State {
         }
     }
 
+    fn element_under_for_seat(
+        global_pos: Point<f64, Global>,
+        output: &Output,
+        shell: &Shell,
+        seat: &Seat<State>,
+    ) -> Option<KeyboardFocusTarget> {
+        if let Some(isolated) = isolated_input_seat(seat) {
+            let workspace = shell.workspaces.space_for_handle(&isolated.workspace)?;
+            return workspace
+                .popup_element_under(global_pos, seat)
+                .or_else(|| workspace.toplevel_element_under(global_pos, seat));
+        }
+        Self::element_under(global_pos, output, shell, seat)
+    }
+
+    fn surface_under_for_seat(
+        global_pos: Point<f64, Global>,
+        output: &Output,
+        shell: &Shell,
+        seat: &Seat<State>,
+    ) -> Option<(PointerFocusTarget, Point<f64, Global>)> {
+        if let Some(isolated) = isolated_input_seat(seat) {
+            let workspace = shell.workspaces.space_for_handle(&isolated.workspace)?;
+            let overview = shell.overview_mode().0;
+            return workspace
+                .popup_surface_under(global_pos, overview.clone(), seat)
+                .or_else(|| workspace.toplevel_surface_under(global_pos, overview, seat));
+        }
+        Self::surface_under(global_pos, output, shell)
+    }
+
     #[profiling::function]
     pub fn element_under(
         global_pos: Point<f64, Global>,
@@ -2392,4 +2552,33 @@ fn mapped_output_for_device<'a, D: Device + 'static>(
         None
     };
     map_to_output.or_else(|| shell.builtin_output())
+}
+
+#[cfg(test)]
+mod isolated_input_tests {
+    use super::isolated_seat_name_for_device;
+
+    #[test]
+    fn device_name_selects_only_an_explicit_isolated_seat() {
+        assert_eq!(
+            isolated_seat_name_for_device(
+                "COSMIC Isolated cosmic-isolated-background-launch-42-7 Pointer"
+            ),
+            Some("cosmic-isolated-background-launch-42-7")
+        );
+        assert_eq!(
+            isolated_seat_name_for_device(
+                "COSMIC Isolated cosmic-isolated-background-launch-42-7 Keyboard"
+            ),
+            Some("cosmic-isolated-background-launch-42-7")
+        );
+        assert_eq!(
+            isolated_seat_name_for_device("Boon Circuit Virtual Pointer"),
+            None
+        );
+        assert_eq!(
+            isolated_seat_name_for_device("COSMIC Isolated seat Touch"),
+            None
+        );
+    }
 }

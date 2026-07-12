@@ -24,7 +24,9 @@ use tracing::{debug, trace};
 pub use self::order::{Stage, render_input_order};
 use self::target::{KeyboardFocusTarget, WindowGroup};
 
-use super::{SeatExt, grabs::SeatMoveGrabState, layout::floating::FloatingLayout};
+use super::{
+    SeatExt, grabs::SeatMoveGrabState, isolated_input_seat, layout::floating::FloatingLayout,
+};
 
 mod order;
 pub mod target;
@@ -392,9 +394,11 @@ fn update_focus_state(
             keyboard.unset_grab(state);
         }
         let serial = serial.unwrap_or_else(|| SERIAL_COUNTER.next_serial());
-        state
-            .common
-            .xwayland_notify_focus_change(target.cloned(), serial);
+        if isolated_input_seat(seat).is_none() {
+            state
+                .common
+                .xwayland_notify_focus_change(target.cloned(), serial);
+        }
         ActiveFocus::set(seat, target.cloned());
         keyboard.set_focus(state, target.cloned(), serial);
         std::mem::drop(keyboard);
@@ -461,6 +465,9 @@ impl Common {
             .cloned()
             .collect::<Vec<_>>();
         for seat in &seats {
+            if isolated_input_seat(seat).is_some() {
+                continue;
+            }
             let mut xwayland_grab = seat
                 .user_data()
                 .get_or_insert(XWaylandGrabSeatData::default)

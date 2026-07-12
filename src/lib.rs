@@ -450,11 +450,13 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
             }
         }
 
+        let mut exited_background_pids = Vec::new();
         state
             .common
             .background_launch_children
             .retain_mut(|child| match child.try_wait() {
                 Ok(Some(exit_status)) => {
+                    exited_background_pids.push(child.id());
                     info!(
                         pid = child.id(),
                         "Background-launched command exited with status {:?}", exit_status
@@ -463,6 +465,7 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
                 }
                 Ok(None) => true,
                 Err(err) => {
+                    exited_background_pids.push(child.id());
                     warn!(
                         pid = child.id(),
                         ?err,
@@ -471,6 +474,16 @@ pub fn run(hooks: crate::hooks::Hooks) -> Result<(), Box<dyn Error>> {
                     false
                 }
             });
+        if !exited_background_pids.is_empty() {
+            let mut shell = state.common.shell.write();
+            for pid in exited_background_pids {
+                if let Err(error) =
+                    shell.release_background_launch_for_root_pid(pid, &state.common.display_handle)
+                {
+                    warn!(pid, ?error, "Failed to release background launch resources");
+                }
+            }
+        }
     })?;
 
     // kill kiosk child if loop exited
