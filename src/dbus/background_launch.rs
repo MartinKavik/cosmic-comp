@@ -28,13 +28,23 @@ pub struct LaunchRequest {
     pub reply: mpsc::Sender<Result<LaunchReply, String>>,
 }
 
+pub struct ReconcileRequest {
+    pub launch_id: String,
+    pub reply: mpsc::Sender<Result<u32, String>>,
+}
+
+pub enum BackgroundRequest {
+    Launch(LaunchRequest),
+    Reconcile(ReconcileRequest),
+}
+
 pub struct LaunchReply {
     pub pid: u32,
     pub launch_id: String,
 }
 
 struct BackgroundLaunch {
-    tx: calloop::channel::Sender<LaunchRequest>,
+    tx: calloop::channel::Sender<BackgroundRequest>,
 }
 
 impl BackgroundLaunch {
@@ -48,14 +58,14 @@ impl BackgroundLaunch {
     ) -> zbus::fdo::Result<(u32, String)> {
         let (reply, rx) = mpsc::channel();
         self.tx
-            .send(LaunchRequest {
+            .send(BackgroundRequest::Launch(LaunchRequest {
                 workspace_name,
                 argv,
                 cwd,
                 env,
                 frame_pacing,
                 reply,
-            })
+            }))
             .map_err(|err| zbus::fdo::Error::Failed(format!("compositor unavailable: {err}")))?;
 
         let reply = rx
@@ -98,13 +108,36 @@ impl BackgroundLaunch {
             .map_err(zbus::fdo::Error::InvalidArgs)?;
         self.request_launch(workspace_name, argv, cwd, env, frame_pacing)
     }
+
+    async fn reconcile(&self, launch_id: String) -> zbus::fdo::Result<u32> {
+        if launch_id.trim().is_empty() {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "launch ID must not be empty".to_string(),
+            ));
+        }
+        let (reply, rx) = mpsc::channel();
+        self.tx
+            .send(BackgroundRequest::Reconcile(ReconcileRequest {
+                launch_id,
+                reply,
+            }))
+            .map_err(|err| zbus::fdo::Error::Failed(format!("compositor unavailable: {err}")))?;
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|err| zbus::fdo::Error::Failed(format!("reconcile timed out: {err}")))?
+            .map_err(zbus::fdo::Error::Failed)
+    }
 }
 
 pub fn init(evlh: &LoopHandle<'static, State>, executor: &ThreadPool) -> Result<RegistrationToken> {
     let (tx, rx) = calloop::channel::channel();
     let token = evlh
         .insert_source(rx, |event, _, state| match event {
-            calloop::channel::Event::Msg(request) => state.handle_background_launch(request),
+            calloop::channel::Event::Msg(BackgroundRequest::Launch(request)) => {
+                state.handle_background_launch(request)
+            }
+            calloop::channel::Event::Msg(BackgroundRequest::Reconcile(request)) => {
+                state.handle_background_reconcile(request)
+            }
             calloop::channel::Event::Closed => (),
         })
         .map_err(|err| err.error)
@@ -119,7 +152,7 @@ pub fn init(evlh: &LoopHandle<'static, State>, executor: &ThreadPool) -> Result<
     Ok(token)
 }
 
-async fn serve(tx: calloop::channel::Sender<LaunchRequest>) -> zbus::Result<()> {
+async fn serve(tx: calloop::channel::Sender<BackgroundRequest>) -> zbus::Result<()> {
     let _connection = zbus::connection::Builder::session()?
         .name(SERVICE_NAME)?
         .serve_at(OBJECT_PATH, BackgroundLaunch { tx })?
@@ -140,6 +173,21 @@ impl State {
                 request.frame_pacing,
             )
             .map_err(|err| err.to_string());
+        let _ = request.reply.send(result);
+    }
+
+    pub fn handle_background_reconcile(&mut self, request: ReconcileRequest) {
+        let result = self
+            .common
+            .shell
+            .write()
+            .reconcile_background_launch(
+                &request.launch_id,
+                &self.common.display_handle,
+                &mut self.common.workspace_state.update(),
+                &self.common.event_loop_handle,
+            )
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX));
         let _ = request.reply.send(result);
     }
 

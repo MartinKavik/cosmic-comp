@@ -14,16 +14,31 @@ struct LaunchArgs {
     argv: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CommandArgs {
+    Launch(LaunchArgs),
+    Reconcile { launch_id: String },
+}
+
 fn usage() -> ! {
     eprintln!(
         "usage: cosmic-background-launch --workspace <name> \
-         [--frame-pacing standard|demand] -- <command> [args...]"
+         [--frame-pacing standard|demand] -- <command> [args...]\n       \
+         cosmic-background-launch --reconcile <launch-id>"
     );
     process::exit(2);
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Option<LaunchArgs> {
-    let mut args = args.into_iter();
+fn parse_args(args: impl IntoIterator<Item = String>) -> Option<CommandArgs> {
+    let mut args = args.into_iter().peekable();
+    if args.peek().is_some_and(|arg| arg == "--reconcile") {
+        args.next();
+        let launch_id = args.next().filter(|value| !value.trim().is_empty())?;
+        if args.next().is_some() {
+            return None;
+        }
+        return Some(CommandArgs::Reconcile { launch_id });
+    }
     let mut workspace_name = None;
     let mut frame_pacing = None;
 
@@ -50,21 +65,31 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Option<LaunchArgs> {
         return None;
     }
 
-    Some(LaunchArgs {
+    Some(CommandArgs::Launch(LaunchArgs {
         workspace_name: workspace_name?,
         frame_pacing: frame_pacing.unwrap_or_else(|| DEFAULT_FRAME_PACING.to_string()),
         argv,
-    })
+    }))
 }
 
 fn main() -> zbus::Result<()> {
-    let Some(LaunchArgs {
+    let Some(command) = parse_args(env::args().skip(1)) else {
+        usage();
+    };
+
+    let conn = Connection::session()?;
+    let proxy = Proxy::new(&conn, SERVICE_NAME, OBJECT_PATH, INTERFACE_NAME)?;
+    let LaunchArgs {
         workspace_name,
         frame_pacing,
         argv,
-    }) = parse_args(env::args().skip(1))
-    else {
-        usage();
+    } = match command {
+        CommandArgs::Reconcile { launch_id } => {
+            let count: u32 = proxy.call("Reconcile", &(launch_id,))?;
+            println!("{count}");
+            return Ok(());
+        }
+        CommandArgs::Launch(args) => args,
     };
 
     let cwd = env::current_dir()
@@ -72,8 +97,6 @@ fn main() -> zbus::Result<()> {
         .and_then(|path| path.into_os_string().into_string().ok())
         .unwrap_or_default();
 
-    let conn = Connection::session()?;
-    let proxy = Proxy::new(&conn, SERVICE_NAME, OBJECT_PATH, INTERFACE_NAME)?;
     let launch_env = HashMap::<String, String>::new();
     let (pid, launch_id): (u32, String) = if frame_pacing == DEFAULT_FRAME_PACING {
         proxy.call("Launch", &(workspace_name, argv, cwd, launch_env))?
@@ -92,7 +115,7 @@ fn main() -> zbus::Result<()> {
 mod tests {
     use super::*;
 
-    fn args(values: &[&str]) -> Option<LaunchArgs> {
+    fn args(values: &[&str]) -> Option<CommandArgs> {
         parse_args(values.iter().map(|value| value.to_string()))
     }
 
@@ -100,21 +123,21 @@ mod tests {
     fn parses_standard_pacing_by_default() {
         assert_eq!(
             args(&["--workspace", "build", "--", "command", "arg"]),
-            Some(LaunchArgs {
+            Some(CommandArgs::Launch(LaunchArgs {
                 workspace_name: "build".to_string(),
                 frame_pacing: "standard".to_string(),
                 argv: vec!["command".to_string(), "arg".to_string()],
-            })
+            }))
         );
     }
 
     #[test]
     fn parses_demand_pacing_in_either_option_order() {
-        let expected = Some(LaunchArgs {
+        let expected = Some(CommandArgs::Launch(LaunchArgs {
             workspace_name: "render".to_string(),
             frame_pacing: "demand".to_string(),
             argv: vec!["command".to_string()],
-        });
+        }));
         assert_eq!(
             args(&[
                 "--workspace",
@@ -153,5 +176,17 @@ mod tests {
             None
         );
         assert_eq!(args(&["--workspace", "render", "--"]), None);
+    }
+
+    #[test]
+    fn parses_only_one_nonempty_reconcile_id() {
+        assert_eq!(
+            args(&["--reconcile", "background-launch-7"]),
+            Some(CommandArgs::Reconcile {
+                launch_id: "background-launch-7".to_string()
+            })
+        );
+        assert_eq!(args(&["--reconcile", ""]), None);
+        assert_eq!(args(&["--reconcile", "id", "extra"]), None);
     }
 }

@@ -5639,6 +5639,84 @@ impl Shell {
             })
     }
 
+    pub fn reconcile_background_launch(
+        &mut self,
+        launch_id: &str,
+        display_handle: &DisplayHandle,
+        workspace_state: &mut WorkspaceUpdateGuard<'_, State>,
+        evlh: &LoopHandle<'static, State>,
+    ) -> Result<usize, String> {
+        self.purge_expired_background_launches();
+        let (root_pid, workspace_name) = self
+            .background_launches
+            .contexts
+            .get(launch_id)
+            .map(|context| (context.root_pid, context.workspace_name.clone()))
+            .ok_or_else(|| format!("unknown or expired background launch `{launch_id}`"))?;
+        let target = self
+            .ensure_background_launch_workspace(&workspace_name, workspace_state)
+            .ok_or_else(|| {
+                format!("background workspace `{workspace_name}` has no usable output")
+            })?;
+
+        let mut surfaces = Vec::new();
+        for workspace in self.workspaces.spaces() {
+            for mapped in workspace.mapped() {
+                for (surface, _) in mapped.windows() {
+                    if !surfaces.contains(&surface) {
+                        surfaces.push(surface);
+                    }
+                }
+            }
+            if let Some(surface) = workspace.get_fullscreen()
+                && !surfaces.contains(surface)
+            {
+                surfaces.push(surface.clone());
+            }
+        }
+
+        let surfaces = surfaces
+            .into_iter()
+            .filter(|surface| {
+                let Some(pid) = surface_pid(surface, display_handle) else {
+                    return false;
+                };
+                process_env_value(pid, BACKGROUND_LAUNCH_ENV).as_deref() == Some(launch_id)
+                    || is_descendant_pid(pid, root_pid)
+            })
+            .collect::<Vec<_>>();
+
+        for surface in &surfaces {
+            let Some(wl_surface) = surface.wl_surface() else {
+                continue;
+            };
+            let Some((from, _)) = self.workspace_for_surface(&wl_surface) else {
+                continue;
+            };
+            if from != target {
+                let _ = self.move_window(
+                    None,
+                    surface,
+                    &from,
+                    &target,
+                    false,
+                    None,
+                    workspace_state,
+                    evlh,
+                );
+            }
+        }
+
+        let seat = self.seats.last_active().clone();
+        let workspace = self
+            .workspaces
+            .space_for_handle_mut(&target)
+            .ok_or_else(|| format!("background workspace `{workspace_name}` disappeared"))?;
+        workspace.set_tiling(true, &seat, workspace_state);
+        self.rebuild_surface_index();
+        Ok(surfaces.len())
+    }
+
     pub fn is_background_launch_surface(&self, surface: &WlSurface) -> bool {
         self.workspace_for_surface(surface)
             .map(|(handle, _)| {
